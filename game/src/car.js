@@ -1,91 +1,106 @@
-// The hero car's driving model: a kinematic arcade model (velocity vector +
-// slip angle + grip), deterministic, no dependency. The car is plain data —
-// x, z, heading, speed and slip — and this file only moves that data. render.js
-// draws it; input.js feeds it.
-import { CAR } from './config.js';
+// The hero car's kinematic arcade model: a velocity vector plus a slip angle and grip, pure
+// simulation with no rendering in it. Deterministic: same inputs, same steps, same car.
+// Heading 0 faces south (+z); forward is (sin(heading), cos(heading)) in (x, z).
+import { CAR, CITY } from './config.js';
 
-/** The car's sim state, fresh from a start pose. */
 export function createCar(start) {
   return {
     x: start.x,
     z: start.z,
     heading: start.heading,
-    speed: 0, // m/s along the heading; negative is reversing
-    vx: 0, // the real velocity vector: it lags the heading when the tail slides
+    vx: 0,
     vz: 0,
-    steer: 0, // -1..1, smoothed
-    slip: 0, // angle between the velocity and the heading, radians
-    drifting: false,
-    distance: 0, // metres driven, for the mission log
-    health: 100, // 0 = wrecked or busted (Day 3: heli fire, hard rams)
-    spin: 0, // rad/s of forced rotation: a PIT sets it, it decays away
+    steer: 0,
+    bump: 0, // frames left of the hit flash the HUD can read
+    distance: 0, // metres driven, for the speed readout and missions
   };
-}
-
-/** Forward vector of a heading, in the x/z plane. */
-export function forwardOf(heading) {
-  return { x: Math.sin(heading), z: Math.cos(heading) };
 }
 
 function clamp(value, min, max) {
   return value < min ? min : value > max ? max : value;
 }
 
+function forwardOf(heading) {
+  return { x: Math.sin(heading), z: Math.cos(heading) };
+}
+
 /**
- * Advance the car one fixed step. `drive` is { throttle: 0..1, steer: -1..1,
- * brake: 0..1, handbrake: boolean }. `limits` is the Day 3 tyre state:
- * { maxSpeedMul, turnMul } — flat tyres cap the speed, damaged steering
- * dulls the turn. Steering bites harder the faster the car goes (up to full
- * speed); the handbrake drops the grip so the tail slides.
+ * One fixed step. `drive` is { steer: -1..1, throttle: -1..1, handbrake: bool }.
+ * The car turns by a bicycle rule (turn rate grows with speed, capped), the engine pushes
+ * along the nose, grip eats the sideways slide, and the handbrake cuts the grip so the tail
+ * steps out. Walls and the world edge are solid. `cap` overrides the top speed — the
+ * police run the same model at 1.08x the player's cap.
  */
-export function driveCar(car, drive, dt, limits) {
-  const maxSpeedMul = limits ? limits.maxSpeedMul : 1;
-  const turnMul = limits ? limits.turnMul : 1;
+export function stepCar(car, drive, city, dt, cap) {
+  const maxSpeed = cap ?? CAR.maxSpeed;
+  const speed = Math.hypot(car.vx, car.vz);
+  const maxSteer = CAR.maxSteerLow + (CAR.maxSteerHigh - CAR.maxSteerLow) * (speed / CAR.maxSpeed);
+  const steerTarget = drive.steer * maxSteer;
+  const steerDelta = clamp(steerTarget - car.steer, -CAR.steerRate * dt, CAR.steerRate * dt);
+  car.steer += steerDelta;
+
+  const turnRate = clamp((speed / CAR.wheelbase) * Math.tan(car.steer), -CAR.maxTurnRate, CAR.maxTurnRate);
+  car.heading += turnRate * dt;
+
+  const fwd = forwardOf(car.heading);
+  const forwardSpeed = car.vx * fwd.x + car.vz * fwd.z;
+  // Engine along the nose; drag grows with speed so top speed is self-limiting.
+  let push = 0;
+  if (drive.throttle > 0) push = drive.throttle * CAR.accel;
+  else if (drive.throttle < 0) push = forwardSpeed > 0.5 ? drive.throttle * CAR.brake : drive.throttle * CAR.reverseAccel;
+  push -= forwardSpeed * CAR.drag;
+  const nextForward = clamp(forwardSpeed + push * dt, -CAR.maxReverse, maxSpeed);
+  // Sideways slide decays by grip (handbrake: much less grip, so the car drifts).
   const grip = drive.handbrake ? CAR.handbrakeGrip : CAR.grip;
-  const turn = (drive.handbrake ? CAR.handbrakeTurn : CAR.turnRate) * turnMul;
-  // Smooth the steering toward the input: the wheel does not snap.
-  const steerTarget = clamp(drive.steer, -1, 1);
-  car.steer += (steerTarget - car.steer) * Math.min(1, 10 * dt);
-  // Speed: engine, brake, drag. Reverse is capped low.
-  if (drive.throttle > 0) car.speed += drive.throttle * CAR.accel * dt;
-  if (drive.brake > 0) car.speed -= drive.brake * CAR.brake * dt;
-  car.speed -= car.speed * CAR.drag * dt;
-  car.speed = clamp(car.speed, -CAR.maxReverse, CAR.maxSpeed * maxSpeedMul);
-  if (drive.throttle === 0 && drive.brake === 0 && Math.abs(car.speed) < 0.15) car.speed = 0;
-  // Heading follows the steering, scaled by how fast the car is moving.
-  const speedFactor = clamp(car.speed / CAR.maxSpeed, -1, 1);
-  car.heading += car.steer * turn * speedFactor * dt;
-  // The velocity vector chases the heading at the grip rate: full grip is no
-  // slide at all, low grip (handbrake) leaves the tail out. Slip is the angle
-  // between the two, and it is what the renderer turns into skid marks.
-  const f = forwardOf(car.heading);
-  const k = Math.min(1, grip * dt);
-  car.vx += (f.x * car.speed - car.vx) * k;
-  car.vz += (f.z * car.speed - car.vz) * k;
-  const px = car.x + car.vx * dt;
-  const pz = car.z + car.vz * dt;
-  const moved = Math.hypot(px - car.x, pz - car.z);
-  car.distance += moved;
-  car.x = px;
-  car.z = pz;
-  const vSpeed = Math.hypot(car.vx, car.vz);
-  if (vSpeed > 0.5) {
-    const dot = clamp((car.vx * f.x + car.vz * f.z) / vSpeed, -1, 1);
-    const cross = f.x * car.vz - f.z * car.vx;
-    car.slip = Math.acos(dot) * (cross < 0 ? -1 : 1);
-  } else {
-    car.slip = 0;
+  const slide = Math.exp(-grip * dt);
+  const sideX = car.vx - forwardSpeed * fwd.x;
+  const sideZ = car.vz - forwardSpeed * fwd.z;
+  car.vx = nextForward * fwd.x + sideX * slide;
+  car.vz = nextForward * fwd.z + sideZ * slide;
+
+  car.x += car.vx * dt;
+  car.z += car.vz * dt;
+  car.distance += Math.hypot(car.vx, car.vz) * dt;
+  if (car.bump > 0) car.bump -= 1;
+
+  collideCity(car, city);
+}
+
+function collideCity(car, city) {
+  const r = CAR.radius;
+  // Building footprints are axis-aligned boxes: push the car out along the shallowest axis.
+  for (let i = 0; i < city.buildings.length; i += 1) {
+    const b = city.buildings[i];
+    const dx = car.x - b.x;
+    const dz = car.z - b.z;
+    const px = b.hw + r - Math.abs(dx);
+    const pz = b.hd + r - Math.abs(dz);
+    if (px > 0 && pz > 0) {
+      if (px < pz) {
+        car.x += dx > 0 ? px : -px;
+        car.vx *= -CAR.bumpKeep * 0.4;
+      } else {
+        car.z += dz > 0 ? pz : -pz;
+        car.vz *= -CAR.bumpKeep * 0.4;
+      }
+      // Kill the speed into the wall, keep the slide along it.
+      const speed = Math.hypot(car.vx, car.vz);
+      if (speed > 1) {
+        car.vx *= CAR.bumpKeep;
+        car.vz *= CAR.bumpKeep;
+      }
+      car.bump = 6;
+    }
   }
-  car.drifting = drive.handbrake && Math.abs(car.speed) > 8;
-  // A PIT spin: the heading is forced around and decays back to the driver.
-  if (car.spin) {
-    car.heading += car.spin * dt;
-    car.spin *= Math.max(0, 1 - 3 * dt);
-    if (Math.abs(car.spin) < 0.05) car.spin = 0;
-  }
+  // The world edge is a wall: the car stops at the sand and the sea.
+  const b = CITY.bounds;
+  if (car.x < b.minX + r) { car.x = b.minX + r; if (car.vx < 0) car.vx = 0; }
+  if (car.x > b.maxX - r) { car.x = b.maxX - r; if (car.vx > 0) car.vx = 0; }
+  if (car.z < b.minZ + r) { car.z = b.minZ + r; if (car.vz < 0) car.vz = 0; }
+  if (car.z > b.maxZ - r) { car.z = b.maxZ - r; if (car.vz > 0) car.vz = 0; }
 }
 
 /** Speed in km/h, for the HUD. */
 export function speedKmh(car) {
-  return Math.round(Math.abs(car.speed) * 3.6);
+  return Math.hypot(car.vx, car.vz) * 3.6;
 }

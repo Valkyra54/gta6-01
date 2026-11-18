@@ -3,88 +3,93 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>DERMAGA EMAS — an open-world crime game</title>
-<link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAUElEQVR4nGOUUzFmIAUwkaSaqhpO9YtjFWdE8wNWdWaFL7HbgMtUZHF6ehqXe9BkERqQfYYJ4LJ0jjhcrkIWR484ODjVL45VP04NRDmJGAAASB0VYUU020IAAAAASUVORK5CYII=">
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #f7c9a0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
-  #game, #game canvas { position: fixed; inset: 0; display: block; }
-  /* Read aloud, never shown: the status line screen readers announce. */
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
   #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-  #hud { position: fixed; inset: 0; pointer-events: none; color: #fff; }
-  .panel { position: absolute; background: rgba(12, 16, 28, 0.72); border: 1px solid rgba(255, 255, 255, 0.22); border-radius: 8px; padding: 10px 14px; }
-  #mission { top: 24px; left: 24px; min-width: 260px; }
-  #mission .no { font-size: 12px; letter-spacing: 2px; color: #ffd166; font-weight: 700; }
-  #mission .title { font-size: 20px; font-weight: 800; margin-top: 2px; }
-  #mission .obj { font-size: 14px; color: #e8ecf3; margin-top: 4px; }
-  #mission .stage { font-size: 12px; color: #9fb3d1; margin-top: 2px; }
+  #hud { position: fixed; inset: 0; pointer-events: none; color: #fff; text-shadow: 0 2px 6px rgba(0,0,0,.55); }
+  .panel { position: absolute; background: rgba(12, 16, 24, .55); border-radius: 10px; padding: 10px 14px; }
+  #mission-panel { top: 24px; left: 24px; min-width: 300px; }
+  #mission-title { font-size: 20px; font-weight: 800; letter-spacing: .06em; color: #ffd166; }
+  #mission-objective { font-size: 20px; margin-top: 2px; }
+  #mission-stage { font-size: 18px; margin-top: 2px; color: #cfe3ff; }
   #wanted { top: 24px; right: 24px; text-align: right; }
-  #stars { font-size: 26px; letter-spacing: 4px; text-shadow: 0 2px 6px rgba(0,0,0,0.6); }
-  #stars .st-on { color: #ffd166; }
-  #stars .st-flash { color: #ffd166; animation: starblink 0.7s steps(2, start) infinite; }
-  #stars .st-red { color: #ff2e63; }
-  #stars .st-hollow { color: #ffd166; opacity: 0.85; }
-  #stars .st-off { color: rgba(255,255,255,0.35); }
-  @keyframes starblink { 50% { opacity: 0.25; } }
-  #desc { font-size: 12px; text-align: right; margin-top: 6px; color: #ffe9a8; line-height: 1.5; display: none; }
-  #desc span { color: #9fb3d1; }
-  #desc .blocked { color: #ff5b7a; font-weight: 700; }
-  #air1 { font-size: 13px; font-weight: 800; color: #ff5b7a; margin-top: 4px; letter-spacing: 1px; display: none; }
-  #cash { font-size: 22px; font-weight: 800; color: #7dff9b; margin-top: 2px; }
-  #clock { font-size: 13px; color: #cfd8e6; margin-top: 2px; }
-  #speedo { bottom: 24px; right: 24px; text-align: right; }
-  #speed { font-size: 44px; font-weight: 900; line-height: 1; }
-  #speed small { font-size: 15px; font-weight: 700; color: #ffd166; }
-  #nitrobar { width: 180px; height: 8px; background: rgba(255,255,255,0.18); border-radius: 4px; margin-top: 6px; overflow: hidden; }
-  #nitrofill { height: 100%; width: 100%; background: #00e5ff; }
-  #radio { font-size: 13px; color: #cfd8e6; margin-top: 6px; }
-  #carname { font-size: 13px; color: #ffd166; font-weight: 700; }
-  #tyres { font-size: 13px; font-weight: 800; color: #ff5b7a; margin-top: 4px; display: none; }
-  #mapwrap { position: absolute; bottom: 24px; left: 24px; width: 208px; height: 208px; border-radius: 50%; overflow: hidden; border: 3px solid rgba(255,255,255,0.35); background: rgba(10, 18, 30, 0.8); box-shadow: 0 4px 18px rgba(0,0,0,0.45); }
-  #minimap { width: 100%; height: 100%; display: block; }
-  #maplabel { position: absolute; bottom: 238px; left: 30px; font-size: 12px; letter-spacing: 2px; color: #ffd166; font-weight: 700; text-shadow: 0 1px 4px rgba(0,0,0,0.7); }
-  #dialog { bottom: 24px; left: 50%; transform: translateX(-50%); max-width: 560px; text-align: left; }
-  #dialog .who { font-size: 12px; letter-spacing: 2px; color: #ff2e63; font-weight: 800; }
-  #dialog .line { font-size: 16px; margin-top: 2px; }
-  #prompt { bottom: 24px; left: 50%; transform: translateX(-50%); font-size: 14px; background: rgba(12,16,28,0.72); border: 1px solid rgba(255,255,255,0.22); border-radius: 8px; padding: 8px 14px; display: none; }
-  #screen { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: linear-gradient(180deg, rgba(20,10,24,0.55), rgba(20,10,24,0.82)); color: #fff; text-align: center; }
-  #screen h1 { font-size: 64px; margin: 0; letter-spacing: 6px; color: #ffd166; text-shadow: 0 4px 24px rgba(255, 46, 99, 0.55); }
-  #screen h2 { font-size: 20px; font-weight: 400; color: #f2a7b8; margin: 8px 0 24px; letter-spacing: 3px; }
-  #screen .controls { font-size: 16px; line-height: 1.9; color: #e8ecf3; }
-  #screen .go { margin-top: 28px; font-size: 18px; font-weight: 800; color: #7dff9b; letter-spacing: 2px; }
-  #screen .tag { margin-top: 18px; font-size: 13px; color: #9fb3d1; font-style: italic; }
+  #stars { font-size: 30px; letter-spacing: .12em; color: #ffd166; line-height: 1; }
+  #stars.blink { animation: blink .5s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+  #stars.near { color: #ff2e2e; }
+  #stars.hollow { color: rgba(255,255,255,.45); }
+  #desc { font-size: 16px; color: #ffd166; white-space: pre-line; margin-top: 6px; line-height: 1.35; }
+  #health { font-size: 18px; font-weight: 800; color: #ff8a8a; margin-top: 2px; }
+  #cash { font-size: 26px; font-weight: 800; margin-top: 4px; }
+  #clock { font-size: 20px; color: #ffe9c9; margin-top: 2px; }
+  #minimap-wrap { position: absolute; left: 24px; bottom: 24px; width: 220px; height: 220px; }
+  #minimap { width: 220px; height: 220px; border-radius: 50%; border: 3px solid rgba(255,255,255,.75); box-shadow: 0 2px 10px rgba(0,0,0,.4); background: #0e4d5c; }
+  #minimap-n { position: absolute; top: 2px; left: 50%; transform: translateX(-50%); font-size: 20px; font-weight: 800; color: #fff; }
+  #speed-panel { position: absolute; right: 24px; bottom: 24px; text-align: right; }
+  #radio { font-size: 20px; color: #ffe9c9; }
+  #speed { font-size: 64px; font-weight: 800; line-height: 1; color: #fff; }
+  #speed-unit { font-size: 20px; color: #ffe9c9; }
+  #nitro-label { font-size: 18px; letter-spacing: .2em; color: #ffd166; margin-top: 2px; }
+  #nitro-bar { width: 180px; height: 10px; margin-left: auto; margin-top: 4px; border-radius: 5px; background: rgba(255,255,255,.25); overflow: hidden; }
+  #nitro-fill { width: 100%; height: 100%; background: #ff2e63; }
+  #dialog { position: absolute; left: 50%; bottom: 24px; transform: translateX(-50%); max-width: 620px; font-size: 20px; background: rgba(12,16,24,.6); border-radius: 8px; padding: 8px 16px; }
+  #prompt { position: absolute; left: 50%; bottom: 96px; transform: translateX(-50%); font-size: 18px; color: #ffe9c9; }
+  .overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; background: linear-gradient(180deg, rgba(20,10,20,.45), rgba(20,10,20,.72)); color: #fff; pointer-events: none; }
+  .overlay h1 { font-size: 96px; margin: 0; letter-spacing: .08em; color: #ffd166; text-shadow: 0 4px 24px rgba(0,0,0,.6); }
+  .overlay .sub { font-size: 24px; letter-spacing: .22em; color: #ffe9c9; margin-top: 6px; }
+  .overlay .tagline { font-size: 22px; font-style: italic; color: #fff; margin-top: 22px; max-width: 760px; }
+  .overlay .mission { font-size: 22px; font-weight: 700; color: #ffd166; margin-top: 18px; }
+  .overlay .controls { font-size: 21px; color: #eef1f5; margin-top: 18px; }
+  .overlay .start { font-size: 24px; font-weight: 700; color: #fff; margin-top: 26px; animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+  #pause-screen h1 { font-size: 64px; }
 </style>
+<script type="importmap">
+  { "imports": { "three": "./vendor/three/three.module.min.js" } }
+</script>
 </head>
 <body>
-<div id="game"></div>
-<div id="hud">
-  <div id="mission" class="panel"><div class="no">MISSION 1 / 3</div><div class="title">Selamat Datang</div><div class="obj">Ikuti Rina ke Pantai — 0/1</div><div class="stage">STAGE 1/3 · Rina menunjukkanmu berkeliling</div></div>
-  <div id="wanted" class="panel"><div id="stars">☆☆☆</div><div id="desc"></div><div id="air1">AIR-1 OVERHEAD</div><div id="cash">$120</div><div id="clock">HARI 1 · 18:52</div></div>
-  <div id="maplabel">PANTAI</div>
-  <div id="mapwrap"><canvas id="minimap" width="416" height="416"></canvas></div>
-  <div id="dialog" class="panel"><div class="who">RINA — WHEELWOMAN</div><div class="line">Selamat datang di Dermaga Emas, Raka. Ikuti aku — dan jangan sentuh mobil pink itu dulu.</div></div>
-  <div id="speedo" class="panel"><div id="speed">0 <small>KM/H</small></div><div id="nitrobar"><div id="nitrofill"></div></div><div id="radio">OMBAY 92.5 · Golden Hour Drive</div><div id="carname">KOMODO GT</div><div id="tyres"></div></div>
-  <div id="prompt"></div>
-</div>
-<div id="screen">
-  <div>
-    <h1>DERMAGA EMAS</h1>
-    <h2>GOLDEN WHARF · AN OPEN-WORLD CRIME GAME</h2>
-    <div class="controls">
-      W A S D / ← ↑ ↓ → &nbsp;drive &nbsp;·&nbsp; SPACE handbrake<br>
-      P pause &nbsp;·&nbsp; mouse camera
-    </div>
-    <div class="go">PRESS SPACE OR CLICK TO START</div>
-    <div class="tag">“Di Dermaga Emas, polisi tidak mengejar mobil — mereka mengejar deskripsinya.”</div>
-  </div>
-</div>
+<canvas id="game" aria-label="DERMAGA EMAS: drive the pink KOMODO GT through a golden-hour coastal city"></canvas>
 <p id="status" role="status" aria-live="polite"></p>
-<script type="importmap">
-{
-  "imports": {
-    "three": "./vendor/three/three.module.min.js"
-  }
-}
-</script>
+<div id="hud">
+  <div id="mission-panel" class="panel">
+    <div id="mission-title">MISSION 1 / 3</div>
+    <div id="mission-objective">Selamat Datang</div>
+    <div id="mission-stage">STAGE 1 / 3</div>
+  </div>
+  <div id="wanted" class="panel">
+    <div id="stars">☆☆☆</div>
+    <div id="desc"></div>
+    <div id="health"></div>
+    <div id="cash">$1,250</div>
+    <div id="clock">HARI 1 · 17:30</div>
+  </div>
+  <div id="minimap-wrap"><canvas id="minimap" width="220" height="220"></canvas><div id="minimap-n">N</div></div>
+  <div id="speed-panel">
+    <div id="radio">♪ OMBAY 92.5</div>
+    <div><span id="speed">0</span> <span id="speed-unit">KM/H</span></div>
+    <div id="nitro-label">NITRO</div>
+    <div id="nitro-bar"><div id="nitro-fill"></div></div>
+  </div>
+  <div id="dialog">RINA — WHEELWOMAN</div>
+  <div id="prompt">WASD drive · SPACE handbrake · P pause</div>
+</div>
+<div id="title-screen" class="overlay">
+  <h1 id="title-name">DERMAGA EMAS</h1>
+  <div id="title-sub" class="sub">GOLDEN WHARF · AN OPEN-WORLD CRIME GAME</div>
+  <div id="title-tagline" class="tagline"></div>
+  <div id="title-mission" class="mission">MISSION 1 / 3 — Selamat Datang</div>
+  <div id="title-controls" class="controls"></div>
+  <div id="title-start" class="start">Press SPACE or click to start</div>
+</div>
+<div id="pause-screen" class="overlay" style="display:none">
+  <h1>PAUSED</h1>
+  <div id="pause-controls" class="controls"></div>
+  <div class="start">Press P to resume</div>
+</div>
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>

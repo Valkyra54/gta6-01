@@ -1,93 +1,88 @@
-// Keyboard and pointer input. Held keys give a driving input; one-shot presses
-// (start, pause, radio, map, exit) are queued as bit flags and taken once by the
-// loop, so a press between two frames is never lost and never counted twice.
-
+// Keyboard + mouse input. Live keys only: WASD/arrows drive, SPACE handbrake (and confirm on
+// the title screen), P pause, mouse drag nudges the chase camera. There is no E, M or R key —
+// nothing in the game uses them, so they are not listed anywhere.
 export const ACTION_CONFIRM = 1;
 export const ACTION_PAUSE = 2;
-export const ACTION_RADIO = 4;
-export const ACTION_MAP = 8;
-export const ACTION_EXIT = 16;
 
-const UP = new Set(['ArrowUp', 'KeyW']);
-const DOWN = new Set(['ArrowDown', 'KeyS']);
-const LEFT = new Set(['ArrowLeft', 'KeyA']);
-const RIGHT = new Set(['ArrowRight', 'KeyD']);
-const BRAKE = new Set(['Space']);
-const CONFIRM = new Set(['Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
-const RADIO = new Set(['KeyR']);
-const MAP = new Set(['KeyM']);
-const EXIT = new Set(['KeyE']);
+const KEY_MAP = {
+  KeyW: 'up', ArrowUp: 'up',
+  KeyS: 'down', ArrowDown: 'down',
+  KeyA: 'left', ArrowLeft: 'left',
+  KeyD: 'right', ArrowRight: 'right',
+  Space: 'handbrake',
+  Enter: 'confirm',
+  KeyP: 'pause', Escape: 'pause',
+};
 
-export function createInput(target) {
-  let up = false;
-  let down = false;
-  let left = false;
-  let right = false;
-  let brake = false;
+export function createInput(canvas) {
+  const held = { up: false, down: false, left: false, right: false, handbrake: false };
   let actions = 0;
-  let mouseDX = 0;
+  let cameraYaw = 0;
+  let dragging = false;
+  let lastX = 0;
 
-  window.addEventListener('keydown', (event) => {
-    if (UP.has(event.code)) up = true;
-    else if (DOWN.has(event.code)) down = true;
-    else if (LEFT.has(event.code)) left = true;
-    else if (RIGHT.has(event.code)) right = true;
-    else if (BRAKE.has(event.code)) {
-      brake = true;
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (CONFIRM.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (PAUSE.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_PAUSE;
-    } else if (RADIO.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_RADIO;
-    } else if (MAP.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_MAP;
-    } else if (EXIT.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_EXIT;
-    } else return;
+  function onKeyDown(event) {
+    const name = KEY_MAP[event.code];
+    if (!name) return;
     event.preventDefault();
-  });
-  window.addEventListener('keyup', (event) => {
-    if (UP.has(event.code)) up = false;
-    else if (DOWN.has(event.code)) down = false;
-    else if (LEFT.has(event.code)) left = false;
-    else if (RIGHT.has(event.code)) right = false;
-    else if (BRAKE.has(event.code)) brake = false;
-  });
-  // A key released while the tab is hidden never sends keyup: let go of everything on blur.
-  window.addEventListener('blur', () => {
-    up = false; down = false; left = false; right = false; brake = false;
-  });
-  target.addEventListener('pointerdown', () => {
-    actions |= ACTION_CONFIRM;
-  });
-  window.addEventListener('mousemove', (event) => {
-    mouseDX += event.movementX || 0;
-  });
+    if (name === 'confirm') actions |= ACTION_CONFIRM;
+    else if (name === 'pause') actions |= ACTION_PAUSE;
+    else if (name === 'handbrake') {
+      if (!event.repeat) actions |= ACTION_CONFIRM; // SPACE also confirms on title/pause screens
+      held.handbrake = true;
+    } else held[name] = true;
+  }
+
+  function onKeyUp(event) {
+    const name = KEY_MAP[event.code];
+    if (!name) return;
+    if (name === 'handbrake') held.handbrake = false;
+    else if (held[name] !== undefined) held[name] = false;
+  }
+
+  function onPointerDown(event) {
+    dragging = true;
+    lastX = event.clientX;
+    canvas.setPointerCapture(event.pointerId);
+  }
+
+  function onPointerMove(event) {
+    if (!dragging) return;
+    cameraYaw += (event.clientX - lastX) * 0.003;
+    cameraYaw = Math.max(-0.9, Math.min(0.9, cameraYaw));
+    lastX = event.clientX;
+  }
+
+  function onPointerUp(event) {
+    dragging = false;
+    if (event.pointerType === 'mouse') actions |= ACTION_CONFIRM; // click confirms on title/pause
+    try { canvas.releasePointerCapture(event.pointerId); } catch { /* already released */ }
+  }
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
 
   return {
-    /** The driving input for this step: throttle 0..1, steer -1..1, brake, handbrake. */
-    drive() {
-      return {
-        throttle: up ? 1 : 0,
-        steer: (right ? 1 : 0) - (left ? 1 : 0),
-        brake: down ? 1 : 0,
-        handbrake: brake,
-      };
+    // -1 left, 0 straight, +1 right.
+    direction() {
+      return (held.right ? 1 : 0) - (held.left ? 1 : 0);
     },
-    /** The one-shot presses since the last call, as ACTION_* flags. */
+    throttle() {
+      return (held.up ? 1 : 0) - (held.down ? 1 : 0);
+    },
+    handbrake() {
+      return held.handbrake;
+    },
+    cameraYaw() {
+      return cameraYaw;
+    },
     takeActions() {
       const taken = actions;
       actions = 0;
       return taken;
-    },
-    /** Horizontal mouse movement since the last call, for the camera. */
-    takeMouseDX() {
-      const dx = mouseDX;
-      mouseDX = 0;
-      return dx;
     },
   };
 }

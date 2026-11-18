@@ -1,253 +1,168 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real
-// rules forward from a fresh state for a fixed number of steps, steered by a
-// simple autopilot (hold the lane, ease off before the road ends), so the frame
-// is what a short drive really looks like and the same seed always gives the
-// same frame. `wall`, `edge` and `street` are verification-only scenes (not
-// submission shots): they stage the Day 2 collision, world-bounds and
-// traffic/ped behaviour so it can be seen in a screenshot instead of only in
-// a headless test.
+// The screenshot scenes behind ?shot=start|play|chase|street|end. Each one plays the real
+// rules forward from a fresh world for a fixed number of steps, steered by a road-following
+// autopilot (it picks the connected segment closest to the car's heading at each junction and
+// brakes for sharp turns), so the frame is what a short drive really looks like and the same
+// seed always gives the same frame.
 import { STEP } from './config.js';
-import { SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './hud.js';
+import { nearestSegment } from './city.js';
+import { SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 import { reportCrime } from './wanted.js';
-import { placePoliceUnit } from './police.js';
-import { nearestRoadPoint } from './collision.js';
+import { spawnPolice } from './police.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_SECONDS = 60;
-const WALL_SECONDS = 4;
-const EDGE_SECONDS = 60;
-const STREET_SECONDS = 3;
+const START_SECONDS = 0;
+const PLAY_SECONDS = 20; // at 26 s the car sat in a building shadow on avenue -120; 20 s should catch it sunlit just after the beachfront turn
+const CHASE_SECONDS = 8;
+const STREET_SECONDS = 20; // the car stops at a red light (~11 s of the 22 s cycle) and the palms line the sightline — a longer drive gets it moving through the junction
 
-/** Steer toward the beach strip lane and hold it; ease off mid-street so the
- *  frame ends with a long clear run of road ahead, not against the south edge. */
-function autopilot(state) {
-  const laneX = state.city.start.x;
-  const lateral = laneX - state.car.x;
-  const steer = Math.max(-1, Math.min(1, lateral * 0.06 - state.car.heading * 1.2));
-  const z = state.car.z;
-  return {
-    throttle: z > -30 ? 0.25 : 1,
-    steer,
-    brake: z > 5 ? 1 : 0,
-    handbrake: false,
-  };
+function wrapAngle(angle) {
+  let a = angle;
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
 }
 
-/** Pure pursuit toward a point on a lane: aim 25 m ahead on the lane line,
- *  in the direction of travel (`dir` +1 south, -1 north), and steer toward
- *  it. Works heading south and north, unlike a fixed-heading autopilot. */
-function laneAutopilot(state, laneX, dir, throttle) {
-  const tx = laneX;
-  const tz = state.car.z + dir * 25;
-  const want = Math.atan2(tx - state.car.x, tz - state.car.z);
-  let diff = want - state.car.heading;
-  while (diff > Math.PI) diff -= Math.PI * 2;
-  while (diff < -Math.PI) diff += Math.PI * 2;
-  return { throttle, steer: Math.max(-1, Math.min(1, diff * 2)), brake: 0, handbrake: false };
-}
-
-/** Full throttle south, no braking: the car must turn back at the
- *  road-network edge instead of driving into the void. */
-function edgeAutopilot(state) {
-  const dir = Math.abs(state.car.heading) < Math.PI / 2 ? 1 : -1;
-  return laneAutopilot(state, state.city.start.x, dir, 1);
-}
-
-/** A busy Kota Lama street: the car drives south on the x=-33 road toward
- *  its traffic-light junction, so the frame shows traffic, peds and a light. */
-function streetAutopilot(state) {
-  return laneAutopilot(state, -36.5, 1, 0.6);
-}
-
-/** The chase circuit: a rectangle of Kota Lama roads, driven lap after lap so
- *  a 26 s chase never reaches the edge of the world. Leg-based, not
- *  waypoint-based: pure pursuit to the far corner cuts across the block,
- *  straight into buildings. Each leg is one road (its lane line, direction,
- *  and end); the aim point is 25 m ahead along the leg, and the leg only
- *  changes once the car reaches the junction — so the car turns at
- *  junctions like a driver. */
-const CHASE_LEGS = [
-  { axis: 'z', line: -168.5, dir: 1, end: 66 }, // south, x=-165 road (the start road)
-  { axis: 'x', line: 69.5, dir: 1, end: 99 }, // east, z=66 road
-  { axis: 'z', line: 95.5, dir: -1, end: -66 }, // north, x=99 road (wrong way)
-  { axis: 'x', line: -69.5, dir: -1, end: -165 }, // west, z=-66 road
-];
-
-export function chaseAutopilot(state) {
-  if (state.chaseLeg === undefined) state.chaseLeg = 0;
-  const leg = CHASE_LEGS[state.chaseLeg];
-  const coord = leg.axis === 'z' ? state.car.z : state.car.x;
-  // Switch legs 25 m before the junction: this car turns at a constant
-  // 20 m radius (turn rate scales with speed, so slowing down does NOT
-  // tighten the turn) — the turn must start a full radius before the
-  // corner, or the arc exits 20 m past the junction, inside the block.
-  // Aiming at the junction itself delays the turn until it is too late.
-  const pastEnd = leg.dir > 0 ? coord >= leg.end - 25 : coord <= leg.end + 25;
-  if (pastEnd) state.chaseLeg = (state.chaseLeg + 1) % CHASE_LEGS.length;
-  const active = CHASE_LEGS[state.chaseLeg];
-  const aim = active.axis === 'z'
-    ? { x: active.line, z: state.car.z + active.dir * 25 }
-    : { x: state.car.x + active.dir * 25, z: active.line };
-  const dx = aim.x - state.car.x;
-  const dz = aim.z - state.car.z;
-  const want = Math.atan2(dx, dz);
-  let diff = want - state.car.heading;
-  while (diff > Math.PI) diff -= Math.PI * 2;
-  while (diff < -Math.PI) diff += Math.PI * 2;
-  // A weave: the chase reads as a chase, not a commute. Under AIR-1 the
-  // weave hardens: the heli's lock breaks at 0.3 rad/s of heading change,
-  // and the gentle weave only reaches 0.23 — so the gunner fires every
-  // three seconds on a straight. A 0.18 weave peaks at 0.34 rad/s and keeps
-  // resetting the lock, the way a swerving player would.
-  const weaveAmp = state.heli && state.heli.state === 'watch' ? 0.18 : 0.12;
-  const weave = Math.sin(state.time * 0.6) * weaveAmp;
-  const steer = Math.max(-1, Math.min(1, diff * 2 + weave));
-  const speed = Math.abs(state.car.speed);
-  // Stuck recovery: a player who drives nose-first into a wall reverses
-  // out — and steers while reversing, so the nose swings onto a new line
-  // instead of re-approaching the same wall at the same angle. Brake at a
-  // standstill reverses the car; a negative speed flips the steering, so
-  // the reverse steer is the opposite sign of the forward one.
-  if (speed < 1) {
-    if (state.chaseStuckSince === undefined) state.chaseStuckSince = state.time;
-  } else {
-    state.chaseStuckSince = undefined;
-    state.chaseReverseUntil = undefined;
+/** A road-following autopilot: chase the far node of the connected segment closest to the nose. */
+export function autopilotDrive(sim) {
+  const { state } = sim;
+  const car = state.car;
+  const speed = Math.hypot(car.vx, car.vz);
+  const near = nearestSegment(state.city, car.x, car.z);
+  if (!near) return { steer: 0, throttle: 1, handbrake: false };
+  const s = near.segment;
+  // The node ahead: the segment end further along the car's travel direction.
+  const fwdX = Math.sin(car.heading);
+  const fwdZ = Math.cos(car.heading);
+  const toA = (s.a.x - car.x) * fwdX + (s.a.z - car.z) * fwdZ;
+  const toB = (s.b.x - car.x) * fwdX + (s.b.z - car.z) * fwdZ;
+  let node = toB >= toA ? s.b : s.a;
+  // At the node, take the connected segment closest to the current heading.
+  let bestNode = node;
+  let bestDot = -2;
+  for (const other of state.city.segments) {
+    if (other === s) continue;
+    const otherNode = other.a === node ? other.b : other.b === node ? other.a : null;
+    if (!otherNode) continue;
+    const dx = otherNode.x - node.x;
+    const dz = otherNode.z - node.z;
+    const len = Math.hypot(dx, dz) || 1;
+    const dot = (dx / len) * fwdX + (dz / len) * fwdZ;
+    if (dot > bestDot) { bestDot = dot; bestNode = otherNode; }
   }
-  if (state.chaseStuckSince !== undefined && state.time - state.chaseStuckSince > 1.5
-      && state.chaseReverseUntil === undefined) {
-    state.chaseReverseUntil = state.time + 2.0;
-  }
-  if (state.chaseReverseUntil !== undefined && state.time < state.chaseReverseUntil) {
-    return { throttle: 0, steer: -steer, brake: 1, handbrake: false };
-  }
-  return {
-    throttle: Math.abs(diff) < 0.35 ? 1 : 0.75,
-    steer,
-    brake: 0,
-    handbrake: false,
-  };
+  // Aim at the junction itself while far away, and only at the far node once close: aiming
+  // at the far node from the start of the approach cuts every corner across the sidewalk.
+  const distToNode = Math.hypot(node.x - car.x, node.z - car.z);
+  const aimX = distToNode > 10 ? node.x : bestNode.x;
+  const aimZ = distToNode > 10 ? node.z : bestNode.z;
+  const desired = Math.atan2(aimX - car.x, aimZ - car.z);
+  const diff = wrapAngle(desired - car.heading);
+  const steer = Math.max(-1, Math.min(1, diff * 1.6));
+  const throttle = Math.abs(diff) > 0.7 && speed > 12 ? -0.5 : 1;
+  return { steer, throttle, handbrake: false };
+}
+
+function driveFor(sim, seconds) {
+  for (let i = 0; i < seconds / STEP; i += 1) sim.step(autopilotDrive(sim));
 }
 
 /**
- * Set `state` to the named scene (start, play or end; any other name is start)
- * by stepping it forward with the autopilot, and return the screen to draw
- * over it. `step` is the sim's one-fixed-step function: step(state, drive).
+ * Set the sim to the named scene and return the screen to draw over it. Any unknown name is
+ * the title scene.
  */
-export function stageShot(name, state, step) {
-  state.car.x = state.city.start.x;
-  state.car.z = state.city.start.z;
-  state.car.heading = state.city.start.heading;
-  state.car.speed = 0;
-  state.car.vx = 0;
-  state.car.vz = 0;
-  state.car.steer = 0;
-  state.time = 0;
+export function stageShot(name, sim, renderer) {
+  sim.reset();
+  if (name === 'play') {
+    renderer.clearFixedCamera();
+    driveFor(sim, PLAY_SECONDS);
+    return { screen: SCREEN_PLAY };
+  }
   if (name === 'chase') {
-    // A 2★ chase that heats to 3★: the player steals down the circuit with
-    // two DEPD cars behind and AIR-1 coming in overhead. The frame at 26 s is
-    // the future cover's core — police lights, helicopter, stars, search zone.
-    // The car starts on the circuit (city.start, the west road) with the
-    // cops behind it on the same road; starting it anywhere else makes the
-    // autopilot cut diagonally across blocks to reach the circuit.
-    state.chaseLeg = 0;
-    reportCrime(state.wanted, 'car-theft', state.car.x, state.car.z, {
-      carColor: 'pink', carModel: 'KOMODO GT', jacket: 'red', weapon: null,
-    }, 0);
-    state.wanted.stars = 2;
-    state.wanted.searchZone = { x: state.car.x, z: state.car.z, radius: 80 };
-    state.wanted.lastKnown = { x: state.car.x, z: state.car.z };
-    placePoliceUnit(state.police, state.car.x, state.car.z - 18, 0);
-    placePoliceUnit(state.police, state.car.x, state.car.z - 30, 0);
-    const CHASE_SECONDS = 26;
-    const ESCALATE_AT = 12;
-    for (let index = 0; index < CHASE_SECONDS / STEP; index += 1) {
-      if (state.time >= ESCALATE_AT && state.wanted.stars === 2) {
-        reportCrime(state.wanted, 'ram-police', state.car.x, state.car.z, {
-          carColor: 'pink', carModel: 'KOMODO GT', jacket: 'red', weapon: null,
-        }, state.time);
-      }
-      step(state, chaseAutopilot(state));
-    }
-    // The cover needs a cop IN the frame: the chase cam looks forward, so
-    // pursuers behind the player are invisible, and a roadblock 45 m out is
-    // thirteen pixels tall. Stage the farthest unit as the roadblock, 30 m
-    // ahead on the player's road and facing the player with its lights on —
-    // the roadblock mechanic, placed where the camera can see it — and the
-    // second-farthest as a flanker door-to-door on the player's left, the
-    // box-in moment, big in the frame.
-    const ahead = nearestRoadPoint(state.city,
-      state.car.x + Math.sin(state.car.heading) * 30,
-      state.car.z + Math.cos(state.car.heading) * 30);
-    const sorted = [...state.police.units].sort((a, b) =>
-      Math.hypot(b.x - state.car.x, b.z - state.car.z)
-      - Math.hypot(a.x - state.car.x, a.z - state.car.z));
-    const far = sorted[0];
-    if (far) {
-      far.x = ahead.x;
-      far.z = ahead.z;
-      far.heading = state.car.heading + Math.PI;
-      far.speed = 0;
-      far.vx = 0;
-      far.vz = 0;
-      far.state = 'roadblock';
-      far.target = { x: ahead.x, z: ahead.z };
-    }
-    const flank = sorted[1];
-    if (flank) {
-      const fx = Math.sin(state.car.heading);
-      const fz = Math.cos(state.car.heading);
-      // Left of the player's heading, two metres ahead: the oncoming lane.
-      flank.x = state.car.x + fz * 3.5 + fx * 2;
-      flank.z = state.car.z - fx * 3.5 + fz * 2;
-      flank.heading = state.car.heading;
-      flank.speed = Math.abs(state.car.speed);
-      flank.vx = state.car.vx;
-      flank.vz = state.car.vz;
-      flank.state = 'pursue';
-      flank.role = 'flank-right';
-    }
+    sim.place(100, 126.5, -Math.PI / 2); // beachfront, westbound — driving INTO the low sun
+    sim.state.fov = 70; // wider chase lens: the low sun sits inside the frame, speed reads faster
+    renderer.clearFixedCamera();
+    driveFor(sim, CHASE_SECONDS);
     return { screen: SCREEN_PLAY };
   }
-  if (name === 'wall') {
-    // Drive straight into a building and hold the throttle: the car must
-    // stop at the wall, never pass through it.
-    const b = state.city.buildings.find((bb) => Math.abs(bb.x) < 120 && Math.abs(bb.z) < 120);
-    state.car.x = b.x;
-    state.car.z = b.z - b.d / 2 - 8;
-    state.car.heading = 0;
-    for (let index = 0; index < WALL_SECONDS / STEP; index += 1) {
-      step(state, { throttle: 1, steer: 0, brake: 0, handbrake: false });
+  if (name === 'wanted') {
+    // A staged 3-star chase on a CITY street: a witnessed assault files the description,
+    // 3 DEPD units spawn ahead, AIR-1 comes up — the frame the cover needs. The beachfront
+    // staging failed (the car sat on sand, the road out of frame, the units too far to
+    // read). Street z=20 runs west through downtown — tall pastel facades both sides — and
+    // the WSW heading puts the low SW sun ~22 deg left of centre, deep in the frame.
+    sim.place(100, 20, -Math.PI / 2); // street z=20, westbound through downtown — the 8 s drive ends mid-downtown, tall facades both sides
+    sim.state.fov = 70;
+    sim.state.camDistance = 9; // pull in: the hero car read small at the 11 m chase distance
+    const w = sim.state.wanted;
+    const desc = { carColor: 'pink', carModel: 'KOMODO GT', jacket: 'red', weapon: 'pistol' };
+    reportCrime(w, { kind: 'assault', x: sim.state.car.x, z: sim.state.car.z, description: desc, seen: true });
+    reportCrime(w, { kind: 'cop', x: sim.state.car.x, z: sim.state.car.z, description: desc, seen: true });
+    spawnPolice(sim.state.police, sim.state.city, sim.state.car, 3);
+    renderer.clearFixedCamera();
+    driveFor(sim, CHASE_SECONDS);
+    // The 8 s drive can end with a PIT spin throwing the car anywhere (a spin turns it
+    // onto an avenue, and the nearest E-W segment is then the beachfront — try-2 landed
+    // on sand). So the snap is to a FIXED downtown spot, not to the car's post-drive
+    // position: the E-W segment nearest (30, 20), mid-block on street z=20 between avenues
+    // 0 and 60, tall facades both sides. The frame is frozen after staging, so the car
+    // holds exactly where placed; the sun (SW) then sits ~22 deg left of centre.
+    const car = sim.state.car;
+    let best = null;
+    let bestD = Infinity;
+    for (const s of sim.state.city.segments) {
+      const dx = s.b.x - s.a.x;
+      const dz = s.b.z - s.a.z;
+      if (Math.abs(dx) < Math.abs(dz) * 3) continue; // not east-west
+      const mx = (s.a.x + s.b.x) / 2;
+      const mz = (s.a.z + s.b.z) / 2;
+      const d = Math.hypot(30 - mx, 20 - mz);
+      if (d < bestD) { bestD = d; best = s; }
     }
-    return { screen: SCREEN_PLAY };
-  }
-  if (name === 'edge') {
-    for (let index = 0; index < EDGE_SECONDS / STEP; index += 1) {
-      step(state, edgeAutopilot(state));
+    const speed = Math.hypot(car.vx, car.vz);
+    if (best) {
+      car.x = 30;
+      car.z = 20;
+      car.heading = -3 * Math.PI / 8; // WSW, into the low sun
+      car.vx = Math.sin(car.heading) * speed;
+      car.vz = Math.cos(car.heading) * speed;
+    }
+    // Cover framing: the pursuit drives past during the 8 s, so the units end up behind
+    // the chase camera. Put two of them back where they READ at 384 px — one flanking
+    // alongside in the next lane (rear three-quarter, light bar on top) and one angled
+    // across the road ahead (full flank + light bar, a rolling roadblock). The frame is
+    // frozen after staging, so they hold exactly where placed.
+    const fx = Math.sin(car.heading);
+    const fz = Math.cos(car.heading);
+    const px = Math.cos(car.heading);
+    const pz = -Math.sin(car.heading);
+    const units = sim.state.police.units;
+    const slots = [
+      { ahead: 3, side: 3.5, heading: car.heading }, // flanker, same direction, right lane
+      { ahead: 10, side: -2.0, heading: car.heading + Math.PI / 2 }, // roadblock, flank to camera — closer, so the light bar reads
+    ];
+    for (let i = 0; i < Math.min(2, units.length); i += 1) {
+      const u = units[i];
+      const slot = slots[i];
+      u.x = car.x + fx * slot.ahead + px * slot.side;
+      u.z = car.z + fz * slot.ahead + pz * slot.side;
+      u.heading = slot.heading;
+      u.vx = 0;
+      u.vz = 0;
     }
     return { screen: SCREEN_PLAY };
   }
   if (name === 'street') {
-    // Stage the car on the southbound lane of the x=-33 road, north of the
-    // Kota Lama traffic-light junction at (-33, 0).
-    state.car.x = -36.5;
-    state.car.z = -60;
-    state.car.heading = 0;
-    for (let index = 0; index < STREET_SECONDS / STEP; index += 1) {
-      step(state, streetAutopilot(state));
-    }
+    sim.place(-3.5, 10, 0); // central avenue, southbound — avenue -60's sightline is blocked by a palm the car stops behind
+    renderer.clearFixedCamera();
+    driveFor(sim, STREET_SECONDS);
     return { screen: SCREEN_PLAY };
   }
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) {
-      step(state, { throttle: 0, steer: 0, brake: 0, handbrake: false });
-    }
-    return { screen: SCREEN_TITLE };
+  if (name === 'end') {
+    sim.place(198, 60, Math.PI / 2); // pier end, harbour behind
+    renderer.setFixedCamera({ x: 165, y: 16, z: 28 }, { x: 185, y: 3, z: 60 });
+    return { screen: SCREEN_PLAY };
   }
-  const limit = name === 'end' ? END_SECONDS : PLAY_SECONDS;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    step(state, autopilot(state));
-  }
-  return { screen: name === 'end' ? SCREEN_PAUSED : SCREEN_PLAY };
+  renderer.setFixedCamera(
+    { x: sim.state.car.x - 55, y: 30, z: sim.state.car.z - 70 },
+    { x: 0, y: 5, z: 20 },
+  );
+  return { screen: SCREEN_TITLE };
 }

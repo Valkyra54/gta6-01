@@ -1,231 +1,181 @@
-// The wanted system: the police hunt the player by DESCRIPTION, not just by
-// sight. A witness phones in what it saw (a 3–5 s call, interruptible); the
-// description degrades every time it is retold; changing the car, the jacket
-// or the weapon drops the match until the police lose the trail. Stars are a
-// line-of-sight game, not a timer: solid gold while a cop sees you, flashing
-// gold while they search, solid red near the scene, hollow when the crime was
-// reported with no description at all. Escape is break line of sight, leave
-// the search zone, stay hidden. Pure sim — plain data, seeded RNG, no DOM.
+// The wanted system: the DEPD hunts the player by DESCRIPTION, not just by sight.
+// A witness report carries a description snapshot (car, jacket, weapon); the description
+// degrades every time it is retold, and changing car or clothes drops the match. Stars
+// have four visual states: solid gold (a unit has line of sight), flashing gold (the
+// trail is searching), solid red (the player is near the last known position), hollow
+// (reported without any description). The search zone is a circle around the last known
+// position; leave it and avoid contact for a few seconds and the trail goes cold.
+// Pure simulation, deterministic from the seed. A cop ramming the player never raises
+// the wanted level — only witness reports do.
+import { WANTED } from './config.js';
 
-/** Seconds of no contact (and outside the zone) before the trail goes cold. */
-const CLEAR_AFTER = { 1: 4, 2: 6, 3: 8 };
-const SEARCH_RADIUS = { 1: 60, 2: 80, 3: 100 };
-const CALL_INTERRUPT_DIST = 2.5;
+/** Stars each crime kind carries: a reckless drive is 1, a shooting seen is 2, a cop is 3. */
+const STARS_BY_CRIME = { theft: 1, reckless: 1, assault: 2, gunshot: 2, cop: 3 };
 
-/** The wanted state, fresh: no stars, nothing known, nowhere to search. */
 export function createWanted() {
   return {
     stars: 0,
-    /** 'none' | 'seen' | 'searching' | 'near' | 'reported' — what the HUD draws. */
-    display: 'none',
-    /** What the police know: null fields are unknown. */
-    description: null,
-    /** 1 = fresh eyewitness; every retell multiplies it by 0.6. */
-    quality: 1,
+    state: 'none', // 'none' | 'los' | 'search' | 'near' | 'hollow'
+    description: null, // { carColor, carModel, jacket, weapon, match }
+    retells: 0,
     lastKnown: null, // { x, z } — where the player was last seen
-    searchZone: null, // { x, z, radius } — the red circle on the map
-    seenTimer: 0, // seconds since anyone last saw the player
-    clearTimer: 0, // seconds of no contact outside the zone
-    heliWatching: false, // AIR-1 overhead: laundry does not work
-    crime: null, // the last reported crime, for the radio (Day 4)
+    searchR: WANTED.searchBaseR,
+    zone: null, // { x, z, r } — the search circle, mirrored to the minimap
+    clearT: 0,
+    los: false,
+    heliWatching: false,
+    flatT: 0, // flat tyres remaining (seconds) after a spike strip
+    arrested: false,
   };
 }
 
-/**
- * One retell of a description: the quality drops and each known field has a
- * (1 - quality) chance of being forgotten. A twice-retold pink KOMODO GT
- * becomes "a dark car", then nothing at all.
- */
-export function degradeDescription(description, quality, rng) {
-  const nextQuality = quality * 0.6;
-  const out = {};
-  for (const key of ['carColor', 'carModel', 'jacket', 'weapon']) {
-    const value = description[key];
-    out[key] = value && rng() < nextQuality ? value : null;
+/** A witness report lands: stars rise, the description is filed, the search zone opens. */
+export function reportCrime(wanted, crime) {
+  const gain = STARS_BY_CRIME[crime.kind] || 1;
+  wanted.stars = Math.min(3, wanted.stars + gain);
+  if (crime.description) {
+    wanted.description = { ...crime.description, match: 1 };
+    wanted.retells = 0;
   }
-  return { description: out, quality: nextQuality };
+  wanted.lastKnown = { x: crime.x, z: crime.z };
+  wanted.searchR = WANTED.searchBaseR + 20 * (wanted.stars - 1);
+  wanted.zone = { x: crime.x, z: crime.z, r: wanted.searchR };
+  wanted.clearT = 0;
+  wanted.state = wanted.description ? 'search' : 'hollow';
+  return wanted.stars;
+}
+
+/** A description retold: each retelling keeps only 60% of the match (1 → 0.6 → 0.36). */
+export function degradeDescription(wanted) {
+  if (!wanted.description) return 0;
+  wanted.retells += 1;
+  wanted.description.match *= WANTED.retellFalloff;
+  return wanted.description.match;
 }
 
 /**
- * A crime is reported: stars rise, the description is what the police know,
- * the last-known position and the search zone move to the scene. A new crime
- * while already wanted raises the level by one (a witness report on a clean
- * record starts at 1 star). Returns true when anything changed.
+ * Change identity while the trail is warm. AIR-1 watching blocks it outright — the
+ * helicopter is the hard counter to description-escape. Otherwise the match drops; below
+ * the floor the description matches nothing and the trail dies at once.
+ * Returns true when the change went through, false when the heli blocked it.
  */
-export function reportCrime(wanted, kind, x, z, description, time) {
-  const base = kind === 'ram-police' || kind === 'gunshot' ? 2 : 1;
-  const next = wanted.stars === 0 ? base : Math.min(3, wanted.stars + (base === 2 ? 1 : 0));
-  if (next === wanted.stars && wanted.description) return false;
-  wanted.stars = next;
-  // A fresh report replaces what is known field by field; unknown fields
-  // stay unknown rather than being overwritten with nothing.
-  if (description) {
-    const old = wanted.description || { carColor: null, carModel: null, jacket: null, weapon: null };
-    wanted.description = {
-      carColor: description.carColor ?? old.carColor,
-      carModel: description.carModel ?? old.carModel,
-      jacket: description.jacket ?? old.jacket,
-      weapon: description.weapon ?? old.weapon,
-    };
-    wanted.quality = 1;
-  }
-  wanted.lastKnown = { x, z };
-  wanted.searchZone = { x, z, radius: SEARCH_RADIUS[next] };
-  wanted.seenTimer = 0;
-  wanted.clearTimer = 0;
-  wanted.crime = { kind, time };
+export function changeIdentity(wanted, kind) {
+  if (wanted.heliWatching) return false;
+  if (!wanted.description) return true;
+  const drop = kind === 'car' ? 0.25 : kind === 'plates' ? 0.4 : 0.5;
+  wanted.description.match *= drop;
+  if (wanted.description.match < WANTED.matchFloor) clearTrail(wanted);
   return true;
 }
 
-/**
- * Witness phone calls that finished: the ped told dispatch, dispatch told
- * the units — one retell, so the description degrades once. A call the
- * player interrupted never arrives. `peds` is the peds sim state.
- */
-export function processWitnessCalls(wanted, peds, time, rng) {
-  let reported = false;
-  for (const ped of peds.list) {
-    if (!ped.call || time < ped.call.endsAt) continue;
-    const call = ped.call;
-    ped.call = null;
-    const degraded = degradeDescription(call.description, call.quality, rng);
-    reportCrime(wanted, call.kind, ped.x, ped.z, degraded.description, time);
-    wanted.quality = degraded.quality;
-    reported = true;
-  }
-  return reported;
+/** The car swap (M3): the description now names the new car, at a 0.2 match — the old
+ * trail goes cold on the next wanted step, when no unit has line of sight. */
+export function swapCarIdentity(wanted, newDescription) {
+  wanted.description = { ...newDescription, match: 0.2 };
 }
 
-/** Segment (x1,z1)-(x2,z2) against one axis-aligned building box, in 2D. */
-function segmentHitsBox(x1, z1, x2, z2, b) {
-  const minX = b.x - b.w / 2;
-  const maxX = b.x + b.w / 2;
-  const minZ = b.z - b.d / 2;
-  const maxZ = b.z + b.d / 2;
-  const dx = x2 - x1;
-  const dz = z2 - z1;
-  let tmin = 0;
-  let tmax = 1;
-  for (const [p, q] of [[-dx, x1 - minX], [dx, maxX - x1], [-dz, z1 - minZ], [dz, maxZ - z1]]) {
-    if (Math.abs(p) < 1e-9) {
-      if (q < 0) return false;
-    } else {
-      const t = q / p;
-      if (p < 0) tmin = Math.max(tmin, t);
-      else tmax = Math.min(tmax, t);
-      if (tmin > tmax) return false;
+/** The trail goes cold: no stars, no description, no search zone. */
+export function clearTrail(wanted) {
+  wanted.stars = 0;
+  wanted.state = 'none';
+  wanted.description = null;
+  wanted.retells = 0;
+  wanted.lastKnown = null;
+  wanted.zone = null;
+  wanted.clearT = 0;
+  wanted.los = false;
+}
+
+/** A spike strip hit: flat tyres for ~25 s, top speed ~40% until repaired. */
+export function applySpike(wanted) {
+  wanted.flatT = WANTED.flatSeconds;
+}
+
+/**
+ * One fixed step. Line of sight is any active police unit within range, or AIR-1
+ * watching from above (the heli never loses contact while it is up). On a sighting the
+ * search zone re-centres on the player; outside the zone with no contact for a few
+ * seconds, the trail goes cold. A description too degraded to match also kills the trail.
+ */
+export function stepWanted(wanted, player, units, dt) {
+  if (wanted.flatT > 0) wanted.flatT -= dt;
+
+  let los = wanted.heliWatching;
+  if (!los) {
+    for (let i = 0; i < units.length; i += 1) {
+      const u = units[i];
+      if (u.wrecked) continue;
+      if (Math.hypot(u.x - player.x, u.z - player.z) < WANTED.losRange) { los = true; break; }
     }
   }
-  return true;
-}
+  wanted.los = los;
 
-/** Line of sight between two points: clear unless a building stands between. */
-export function hasLineOfSight(x1, z1, x2, z2, city, maxDist) {
-  const dist = Math.hypot(x2 - x1, z2 - z1);
-  if (dist > maxDist) return false;
-  for (const b of city.buildings) {
-    // Cheap reject: the box is nowhere near the segment's bounding box.
-    if (Math.max(x1, x2) < b.x - b.w / 2 || Math.min(x1, x2) > b.x + b.w / 2) continue;
-    if (Math.max(z1, z2) < b.z - b.d / 2 || Math.min(z1, z2) > b.z + b.d / 2) continue;
-    if (segmentHitsBox(x1, z1, x2, z2, b)) return false;
-  }
-  return true;
-}
-
-/** Does this police unit see the player right now (range + line of sight)? */
-export function unitSeesPlayer(unit, player, city) {
-  return hasLineOfSight(unit.x, unit.z, player.x, player.z, city, 70);
-}
-
-/**
- * One fixed step of the wanted state. `police` is the police sim state
- * (units with x/z), `heliWatching` is set by the helicopter. While anyone
- * sees the player the trail is hot; once sight is broken the search zone
- * stays where the player was last seen, and leaving it unseen for a few
- * seconds clears the level.
- */
-export function updateWanted(wanted, player, police, heliWatching, city, dt) {
   if (wanted.stars === 0) {
-    wanted.display = 'none';
-    wanted.searchZone = null;
-    wanted.lastKnown = null;
+    wanted.state = 'none';
+    wanted.zone = null;
+    wanted.clearT = 0;
     return;
   }
-  const seen = heliWatching || police.units.some((u) => u.state !== 'wrecked' && unitSeesPlayer(u, player, city));
-  if (seen) {
-    wanted.display = 'seen';
+
+  if (los) {
     wanted.lastKnown = { x: player.x, z: player.z };
-    wanted.searchZone = { x: player.x, z: player.z, radius: SEARCH_RADIUS[wanted.stars] };
-    wanted.seenTimer = 0;
-    wanted.clearTimer = 0;
+    wanted.zone = { x: player.x, z: player.z, r: wanted.searchR };
+    wanted.clearT = 0;
+    wanted.state = 'los';
     return;
   }
-  wanted.seenTimer += dt;
-  // Near the scene: a unit close to the last-known spot turns the stars red.
-  const nearScene = police.units.some((u) => {
-    if (!wanted.lastKnown || u.state === 'wrecked') return false;
-    return Math.hypot(u.x - wanted.lastKnown.x, u.z - wanted.lastKnown.z) < 25;
-  });
-  const known = wanted.description
-    && (wanted.description.carColor || wanted.description.carModel
-      || wanted.description.jacket || wanted.description.weapon);
-  wanted.display = nearScene ? 'near' : known ? 'searching' : 'reported';
-  // Outside the zone and unseen: the trail goes cold.
-  const inZone = wanted.searchZone
-    && Math.hypot(player.x - wanted.searchZone.x, player.z - wanted.searchZone.z) < wanted.searchZone.radius;
-  if (!inZone && wanted.seenTimer > CLEAR_AFTER[wanted.stars]) {
-    wanted.clearTimer += dt;
-    if (wanted.clearTimer > 3) {
-      wanted.stars = 0;
-      wanted.display = 'none';
-      wanted.description = null;
-      wanted.quality = 1;
-      wanted.lastKnown = null;
-      wanted.searchZone = null;
-      wanted.clearTimer = 0;
-      wanted.seenTimer = 0;
-      wanted.crime = null;
-    }
+
+  if (!wanted.description) {
+    wanted.state = 'hollow';
+  } else if (wanted.description.match < WANTED.matchFloor) {
+    clearTrail(wanted);
+    return;
   } else {
-    wanted.clearTimer = 0;
+    const d = Math.hypot(player.x - wanted.lastKnown.x, player.z - wanted.lastKnown.z);
+    wanted.state = d < wanted.searchR * 0.5 ? 'near' : 'search';
+    if (d > wanted.searchR) {
+      wanted.clearT += dt;
+      if (wanted.clearT >= WANTED.clearSeconds) {
+        clearTrail(wanted);
+        return;
+      }
+    } else {
+      wanted.clearT = 0;
+    }
+  }
+  if (wanted.lastKnown) {
+    wanted.zone = { x: wanted.lastKnown.x, z: wanted.lastKnown.z, r: wanted.searchR };
   }
 }
 
 /**
- * Laundry: change the car, the jacket, the weapon or the plates, and the
- * police lose that part of the description. While AIR-1 watches, none of it
- * works — the helicopter is the hard counter to description-escape. When
- * every field is gone, the police have nothing to hunt and the level clears.
+ * Interrupt a witness phone call: any ped in the 'report' state within range of the
+ * player is stopped before the call ends — no stars from that witness. Returns how many
+ * calls were interrupted.
  */
-export function applyLaundry(wanted, what) {
-  if (wanted.heliWatching) return { ok: false, reason: 'AIR-1 di atas — ganti mobil/pakaian tidak berguna' };
-  if (wanted.stars === 0 || !wanted.description) return { ok: false, reason: 'Tidak ada yang dicari' };
-  if (what === 'car' || what === 'plates') {
-    wanted.description.carColor = null;
-    wanted.description.carModel = null;
-  } else if (what === 'jacket') {
-    wanted.description.jacket = null;
-  } else if (what === 'weapon') {
-    wanted.description.weapon = null;
-  } else {
-    return { ok: false, reason: 'Tidak dikenal' };
+export function interruptReports(peds, player) {
+  let count = 0;
+  const all = peds.walkers.concat(peds.idlers);
+  for (const ped of all) {
+    if (ped.state !== 'report' || !ped.sawIt) continue;
+    if (Math.hypot(ped.x - player.x, ped.z - player.z) > WANTED.reportInterruptRange) continue;
+    ped.state = 'walk';
+    ped.calmT = 6;
+    ped.sawIt = null;
+    ped.reportT = 0;
+    count += 1;
   }
-  const left = wanted.description.carColor || wanted.description.carModel
-    || wanted.description.jacket || wanted.description.weapon;
-  if (!left) {
-    wanted.stars = 0;
-    wanted.display = 'none';
-    wanted.description = null;
-    wanted.quality = 1;
-    wanted.lastKnown = null;
-    wanted.searchZone = null;
-    wanted.crime = null;
-    return { ok: true, cleared: true };
-  }
-  return { ok: true, cleared: false };
+  return count;
 }
 
-/** A witness within arm's reach drops the phone: the call never arrives. */
-export function callInterruptDistance() {
-  return CALL_INTERRUPT_DIST;
+/** What the HUD shows under the stars: what the police know, and how to change it. */
+export function descriptionLines(wanted) {
+  if (!wanted.description || wanted.stars === 0) return [];
+  const d = wanted.description;
+  const lines = [];
+  lines.push({ label: `CAR: ${d.carColor} ${d.carModel}`, hint: 'ganti mobil / cat baru' });
+  if (d.match >= 0.4) lines.push({ label: `JACKET: ${d.jacket}`, hint: 'ganti jaket' });
+  if (d.match > 0.6 && d.weapon) lines.push({ label: `WEAPON: ${d.weapon}`, hint: 'buang senjata' });
+  if (d.match < 0.6) lines.push({ label: 'DESKRIPSI KABUR — retold, makin samar', hint: '' });
+  return lines;
 }

@@ -1,296 +1,262 @@
-// Pedestrians: groups of 2–4 walking the sidewalks, a few standing idle
-// (phone, smoking, leaning, window-shopping) with an activity that rotates
-// every few minutes. They flee from the hero car; a fleeing ped remembers
-// what it saw — the "saw it" flag Day 3's wanted system reads. No wanted
-// logic lives here: this file only walks, idles, flees and remembers.
+// Pedestrians: walkers in groups of 2–4 on the sidewalks plus idlers with rotating
+// activities, and the witness chain Day 3 builds on. A ped that sees a threat runs first
+// and then stops to report (the phone call is Day 3); running sets `sawIt`, a description
+// snapshot of what the ped saw. ~83% of peds react; the rest keep walking. Pure simulation,
+// deterministic from the seed. The causeway and pier never carry peds.
+import { PEDS } from './config.js';
+import { createRandom, intRange, pick, range } from './random.js';
+import { nearestSegment } from './city.js';
 
-import { chance, createRandom, pick, range, rangeInt } from './random.js';
+const CLOTHES = [0x7a6a8a, 0x4a6b7a, 0x8a7a5a, 0x5a7a5a, 0x9a9a9a, 0x6a5a7a, 0x7a5a4a, 0x3a5a6a];
+const SKIN = [0xe8c39a, 0xc99a6a, 0x8a5a3a, 0xf2d5b0];
+const ACTIVITIES = ['phone', 'smoking', 'leaning', 'window', 'map'];
 
-const WALKERS = 36;
-const IDLERS = 10;
-const SIDEWALK = 8.5; // metres from a road centreline to the walking line
-const FLEE_SPEED = 3.5;
-const FLEE_RADIUS = 8;
-const FLEE_TIME = 2.5;
-const SHIRTS = ['#E8E4DA', '#7FB3D5', '#D9A441', '#C96F4A', '#8FAE8B', '#F2A7B8', '#5B7A99', '#E8B4C8', '#FFF3E0', '#9FD8CF'];
-const SKINS = ['#E8B48C', '#C98A6B', '#8A5A3B'];
-const ACTIVITIES = ['phone', 'smoking', 'leaning', 'window-shopping'];
+function walkable(seg) {
+  return seg.kind !== 'causeway' && seg.kind !== 'pier';
+}
 
-/** The sidewalk point on a segment, `d` metres along it, on `side` (+1/-1). */
-function sidewalkPoint(seg, side, d) {
-  const len = Math.hypot(seg.bx - seg.ax, seg.bz - seg.az);
-  const dx = (seg.bx - seg.ax) / len;
-  const dz = (seg.bz - seg.az) / len;
-  const rx = -dz;
-  const rz = dx;
+/** Where a sidewalk walker stands: the segment at `s`, on `side`, with a fixed jitter. */
+function sidewalkPos(seg, side, s, lateral) {
+  const dx = seg.b.x - seg.a.x;
+  const dz = seg.b.z - seg.a.z;
+  const len = Math.hypot(dx, dz) || 1;
+  const nx = -dz / len;
+  const nz = dx / len;
+  const t = s / len;
   return {
-    x: seg.ax + dx * d + rx * side * SIDEWALK,
-    z: seg.az + dz * d + rz * side * SIDEWALK,
-    heading: Math.atan2(dx, dz),
-    rx,
-    rz,
+    x: seg.a.x + dx * t + nx * (side * PEDS.sidewalkOffset + lateral),
+    z: seg.a.z + dz * t + nz * (side * PEDS.sidewalkOffset + lateral),
   };
 }
 
-function makePed(random, city, segIndex, side, d, speed, forward, kind) {
-  const seg = city.segments[segIndex];
-  const point = sidewalkPoint(seg, side, d);
-  const lateral = range(random, -1, 1);
-  const activity = pick(random, ACTIVITIES);
-  // Idle peds face something: the building when window-shopping, the road
-  // otherwise. Walkers face where they are going.
-  const heading = kind === 'idle'
-    ? (activity === 'window-shopping'
-      ? Math.atan2(point.rx * side, point.rz * side)
-      : Math.atan2(-point.rx * side, -point.rz * side))
-    : (forward ? point.heading : point.heading + Math.PI);
-  return {
-    kind,
-    seg: segIndex,
-    side,
-    d,
-    speed,
-    forward,
-    lateral,
-    x: point.x + point.rx * lateral,
-    z: point.z + point.rz * lateral,
-    heading,
-    bob: range(random, 0, Math.PI * 2),
-    color: pick(random, SHIRTS),
-    skin: pick(random, SKINS),
-    reactive: chance(random, 0.83), // ~80–85% react; some keep walking
-    activity,
-    activityTimer: range(random, 120, 240),
-    fleeTimer: 0,
-    // Waypoint a walker heads for when it turns a corner: the sidewalk
-    // corner, so it never cuts across the junction through the road.
-    via: null,
-    sawIt: null,
-    // A witness phone call in progress: { kind, description, endsAt, quality }.
-    // The ped stands still with the phone until it ends (the report lands) or
-    // the player gets close enough to interrupt it. Day 3 owns the call.
-    call: null,
-    rng: createRandom(Math.floor(random() * 2147483647)),
-  };
-}
-
-/** Spawn the peds: walking groups on the sidewalks, a few standing idle. */
-export function createPeds(city, seed) {
-  const random = createRandom(seed ^ 0x9e37);
-  const list = [];
-  let guard = 0;
-  while (list.length < WALKERS && guard < 200) {
-    guard += 1;
-    const segIndex = Math.floor(random() * city.segments.length);
-    const seg = city.segments[segIndex];
-    // Peds never walk the causeway to the island: it is a car bridge, and
-    // its "sidewalk" would hang over the water.
-    if (segmentLength(seg) > 100) continue;
-    const side = chance(random, 0.5) ? 1 : -1;
-    const groupSize = rangeInt(random, 2, 4);
-    const d = range(random, 6, Math.max(7, segmentLength(seg) - 6));
-    const speed = range(random, 1.0, 1.5);
-    const forward = chance(random, 0.5);
-    for (let k = 0; k < groupSize && list.length < WALKERS; k += 1) {
-      list.push(makePed(random, city, segIndex, side, d + range(random, -1.5, 1.5), speed, forward, 'walk'));
-    }
-  }
-  while (list.length < WALKERS + IDLERS && guard < 400) {
-    guard += 1;
-    const segIndex = Math.floor(random() * city.segments.length);
-    const seg = city.segments[segIndex];
-    if (segmentLength(seg) > 100) continue;
-    const side = chance(random, 0.5) ? 1 : -1;
-    const d = range(random, 8, Math.max(9, segmentLength(seg) - 8));
-    list.push(makePed(random, city, segIndex, side, d, 0, true, 'idle'));
-  }
-  return { list };
-}
-
-function segmentLength(seg) {
-  return Math.hypot(seg.bx - seg.ax, seg.bz - seg.az);
-}
-
-/** A new segment at a node: any segment touching it, not the one we came from. */
-function pickNextSegment(city, ped, node) {
-  const candidates = [];
-  city.segments.forEach((s, i) => {
-    if (i === ped.seg) return;
-    // Never turn onto the causeway (see createPeds).
-    if (segmentLength(s) > 100) return;
-    const touchesStart = Math.abs(s.ax - node.x) < 1 && Math.abs(s.az - node.z) < 1;
-    const touchesEnd = Math.abs(s.bx - node.x) < 1 && Math.abs(s.bz - node.z) < 1;
-    if (touchesStart || touchesEnd) candidates.push({ index: i, atStart: touchesStart });
-  });
-  if (candidates.length === 0) return { index: ped.seg, atStart: true };
-  return candidates[Math.floor(ped.rng() * candidates.length)];
-}
-
-/**
- * A witness event: every reactive ped within `radius` remembers what it saw
- * AND starts a phone call to dispatch (3–5 s, interruptible). Day 3's wanted
- * system reads the call when it completes; the description degrades when
- * retold — that is Day 3's job; here it is recorded verbatim.
- */
-export function witnessEvent(peds, kind, x, z, radius, description, time) {
-  for (const ped of peds.list) {
-    if (!ped.reactive) continue;
-    if (Math.hypot(ped.x - x, ped.z - z) > radius) continue;
-    ped.sawIt = { kind, description: { ...description }, time };
-    ped.call = {
-      kind,
-      description: { ...description },
-      endsAt: time + 3 + ped.rng() * 2,
-      quality: 1,
-    };
-  }
-}
-
-function stepPed(ped, city, player, dt, time) {
-  // --- Flee: the hero car is close, or closing fast. ---
+function startFlee(ped, player, time) {
   const dx = ped.x - player.x;
   const dz = ped.z - player.z;
-  const dist = Math.hypot(dx, dz);
+  const d = Math.hypot(dx, dz) || 1;
+  ped.fleeX = dx / d;
+  ped.fleeZ = dz / d;
+  ped.state = 'flee';
+  ped.fleeT = PEDS.fleeSeconds;
+  ped.sawIt = { carColor: 'pink', carModel: 'KOMODO GT', at: time };
+}
+
+function isThreat(ped, player, playerSpeed) {
+  if (!ped.reactive || ped.calmT > 0) return false;
+  const d = Math.hypot(ped.x - player.x, ped.z - player.z);
+  if (d < PEDS.fleeRadius) return true;
+  return playerSpeed > PEDS.closingSpeed && d < PEDS.closingRadius;
+}
+
+export function createPeds(city, seed) {
+  const random = createRandom(seed + 202);
+  const walkSegs = city.segments.filter(walkable);
+  const walkers = [];
+  let group = 0;
+  while (walkers.length < PEDS.walkers) {
+    const size = Math.min(intRange(random, 2, 4), PEDS.walkers - walkers.length);
+    const seg = pick(random, walkSegs);
+    const side = random() < 0.5 ? 1 : -1;
+    const dir = random() < 0.5 ? 1 : -1;
+    const speed = range(random, 1.2, 1.5);
+    const s0 = range(random, 12, seg.length - 12);
+    for (let k = 0; k < size; k += 1) {
+      const ped = {
+        group,
+        seg,
+        side,
+        s: s0 - k * 1.6 * dir,
+        dir,
+        speed: speed + range(random, -0.1, 0.1),
+        lateral: range(random, -0.8, 0.8),
+        x: 0,
+        z: 0,
+        heading: 0,
+        reactive: random() < PEDS.reactiveShare,
+        state: 'walk',
+        fleeT: 0,
+        reportT: 0,
+        calmT: 0,
+        fleeX: 0,
+        fleeZ: 0,
+        sawIt: null,
+        color: pick(random, CLOTHES),
+        skin: pick(random, SKIN),
+      };
+      const pos = sidewalkPos(seg, side, ped.s, ped.lateral);
+      ped.x = pos.x;
+      ped.z = pos.z;
+      ped.heading = dir > 0 ? seg.angle : seg.angle + Math.PI;
+      walkers.push(ped);
+    }
+    group += 1;
+  }
+
+  const idlers = [];
+  for (let i = 0; i < PEDS.idlers; i += 1) {
+    const seg = pick(random, walkSegs);
+    const side = random() < 0.5 ? 1 : -1;
+    const s = range(random, 8, seg.length - 8);
+    const pos = sidewalkPos(seg, side, s, range(random, -0.8, 0.8));
+    idlers.push({
+      homeX: pos.x,
+      homeZ: pos.z,
+      x: pos.x,
+      z: pos.z,
+      heading: seg.angle + (random() < 0.5 ? 0 : Math.PI),
+      activity: pick(random, ACTIVITIES),
+      timer: range(random, 120, 240),
+      reactive: random() < PEDS.reactiveShare,
+      state: 'idle',
+      fleeT: 0,
+      reportT: 0,
+      calmT: 0,
+      fleeX: 0,
+      fleeZ: 0,
+      sawIt: null,
+      color: pick(random, CLOTHES),
+      skin: pick(random, SKIN),
+    });
+  }
+  return { walkers, idlers, random };
+}
+
+/** Snap a walker back onto the nearest sidewalk after it ran off it. */
+function resnapWalker(ped, city) {
+  const near = nearestSegment(city, ped.x, ped.z);
+  if (!near) return;
+  const s = near.segment;
+  const dx = s.b.x - s.a.x;
+  const dz = s.b.z - s.a.z;
+  const len = Math.hypot(dx, dz) || 1;
+  const nx = -dz / len;
+  const nz = dx / len;
+  const relX = ped.x - s.a.x;
+  const relZ = ped.z - s.a.z;
+  const lateral = relX * nx + relZ * nz;
+  ped.seg = s;
+  ped.side = lateral >= 0 ? 1 : -1;
+  ped.s = Math.max(1, Math.min(len - 1, (relX * dx + relZ * dz) / len));
+  ped.lateral = Math.max(-0.8, Math.min(0.8, Math.abs(lateral) - PEDS.sidewalkOffset));
+  ped.dir = 1;
+  ped.heading = s.angle;
+}
+
+/** One fixed step for every ped. `player` is {x, z, vx, vz}. `onReport`, when given, is
+ * called with a ped whose phone call just got through — the witness files a report. */
+export function stepPeds(peds, city, player, dt, time, onReport) {
   const playerSpeed = Math.hypot(player.vx, player.vz);
-  // --- On a witness call: stand still with the phone. Close enough and the
-  // player interrupts it — the ped drops the phone and runs, and the report
-  // never arrives. ---
-  if (ped.call) {
-    if (dist < 2.5) {
-      ped.call = null;
-      ped.fleeTimer = FLEE_TIME;
-    } else {
-      ped.bob += dt * 0.5;
-      return;
-    }
-  }
-  const closing = dist < 14 && playerSpeed > 12
-    && (player.vx * dx + player.vz * dz) / (playerSpeed * Math.max(dist, 0.01)) < -0.7;
-  if (ped.reactive && ped.fleeTimer <= 0 && (dist < FLEE_RADIUS || closing)) {
-    ped.fleeTimer = FLEE_TIME;
-    // A fleeing ped drops the phone: no call, only the memory of what it saw.
-    ped.call = null;
-    ped.sawIt = {
-      kind: 'reckless-driving',
-      description: { carColor: 'pink', carModel: 'KOMODO GT', jacket: null, weapon: null },
-      time,
-    };
-  }
-  if (ped.fleeTimer > 0) {
-    ped.fleeTimer -= dt;
-    const away = dist > 0.01 ? { x: dx / dist, z: dz / dist } : { x: 0, z: 1 };
-    ped.x += away.x * FLEE_SPEED * dt;
-    ped.z += away.z * FLEE_SPEED * dt;
-    ped.heading = Math.atan2(away.x, away.z);
-    ped.bob += FLEE_SPEED * dt * 2.4;
-    return;
-  }
-  if (ped.kind === 'idle') {
-    ped.activityTimer -= dt;
-    if (ped.activityTimer <= 0) {
-      ped.activity = ACTIVITIES[Math.floor(ped.rng() * ACTIVITIES.length)];
-      ped.activityTimer = range(ped.rng(), 120, 240);
-    }
-    ped.bob += dt * 0.5;
-    return;
-  }
-  // --- Walk: follow the sidewalk, turn at the segment's end. ---
-  // While a corner waypoint is pending the ped walks to it and does not
-  // advance along the new segment, so it can never cut the junction.
-  const seg = city.segments[ped.seg];
-  const len = segmentLength(seg);
-  if (!ped.via) {
-    ped.d += (ped.forward ? 1 : -1) * ped.speed * dt;
-    if (ped.d > len - 2 || ped.d < 2) {
-      const node = ped.d > len - 2 ? { x: seg.bx, z: seg.bz } : { x: seg.ax, z: seg.az };
-      const next = pickNextSegment(city, ped, node);
-      const oldIndex = ped.seg;
-      const oldSide = ped.side;
-      // The side relative to the walking direction (not the segment's
-      // stored direction): keep it through the turn, so the ped never
-      // crosses the street to change sidewalks.
-      const walkSide = ped.forward ? ped.side : -ped.side;
-      ped.seg = next.index;
-      const nextSeg = city.segments[next.index];
-      const nextLen = segmentLength(nextSeg);
-      ped.forward = next.atStart;
-      ped.d = next.atStart ? 2 : nextLen - 2;
-      ped.side = ped.forward ? walkSide : -walkSide;
-      // Turning onto a perpendicular street: walk the sidewalk corner
-      // first (the point 8.5 m off both centrelines on our side), instead
-      // of cutting straight across the junction through the road.
-      const dirOld = { x: (seg.bx - seg.ax) / len, z: (seg.bz - seg.az) / len };
-      const dirNew = { x: (nextSeg.bx - nextSeg.ax) / nextLen, z: (nextSeg.bz - nextSeg.az) / nextLen };
-      const dot = dirOld.x * dirNew.x + dirOld.z * dirNew.z;
-      if (next.index !== oldIndex && Math.abs(dot) < 0.5) {
-        const rOld = { x: -dirOld.z, z: dirOld.x };
-        const rNew = { x: -dirNew.z, z: dirNew.x };
-        ped.via = {
-          x: node.x + rOld.x * oldSide * SIDEWALK + rNew.x * ped.side * SIDEWALK,
-          z: node.z + rOld.z * oldSide * SIDEWALK + rNew.z * ped.side * SIDEWALK,
-        };
-      } else {
-        ped.via = null;
+
+  for (const ped of peds.walkers) {
+    if (ped.calmT > 0) ped.calmT -= dt;
+    if (ped.state === 'walk' && isThreat(ped, player, playerSpeed)) startFlee(ped, player, time);
+
+    if (ped.state === 'walk') {
+      ped.s += ped.dir * ped.speed * dt;
+      if (ped.s >= ped.seg.length - 1 || ped.s <= 1) {
+        // At the end of the street: turn onto a connected walkable segment.
+        const node = ped.s >= ped.seg.length - 1 ? ped.seg.b : ped.seg.a;
+        const options = city.segments.filter((s) => s !== ped.seg && walkable(s) && (s.a === node || s.b === node));
+        if (options.length > 0) {
+          const next = options[Math.floor(peds.random() * options.length)];
+          ped.seg = next;
+          ped.side = peds.random() < 0.5 ? 1 : -1;
+          ped.dir = next.a === node ? 1 : -1;
+          ped.s = ped.dir > 0 ? 1 : next.length - 1;
+        } else {
+          ped.dir = -ped.dir;
+          ped.s = Math.max(1, Math.min(ped.seg.length - 1, ped.s));
+        }
+      }
+      const pos = sidewalkPos(ped.seg, ped.side, ped.s, ped.lateral);
+      ped.x = pos.x;
+      ped.z = pos.z;
+      ped.heading = ped.dir > 0 ? ped.seg.angle : ped.seg.angle + Math.PI;
+    } else if (ped.state === 'flee') {
+      ped.x += ped.fleeX * PEDS.fleeSpeed * dt;
+      ped.z += ped.fleeZ * PEDS.fleeSpeed * dt;
+      ped.heading = Math.atan2(ped.fleeX, ped.fleeZ);
+      ped.fleeT -= dt;
+      if (ped.fleeT <= 0) {
+        ped.state = 'report';
+        ped.reportT = PEDS.reportSeconds;
+      }
+    } else if (ped.state === 'report') {
+      ped.reportT -= dt;
+      if (ped.reportT <= 0) {
+        // The call got through: the witness files a report (Day 3 hook).
+        if (onReport) onReport(ped);
+        ped.state = 'walk';
+        ped.calmT = PEDS.calmSeconds;
+        resnapWalker(ped, city);
       }
     }
   }
-  let tx;
-  let tz;
-  if (ped.via) {
-    tx = ped.via.x;
-    tz = ped.via.z;
-    if (Math.hypot(tx - ped.x, tz - ped.z) < 0.6) {
-      // Corner reached: resume along the new segment from where we are.
-      ped.via = null;
-      const ns = city.segments[ped.seg];
-      const nlen = segmentLength(ns);
-      const ndx = (ns.bx - ns.ax) / nlen;
-      const ndz = (ns.bz - ns.az) / nlen;
-      ped.d = Math.max(2, Math.min(nlen - 2, (ped.x - ns.ax) * ndx + (ped.z - ns.az) * ndz));
+
+  for (const ped of peds.idlers) {
+    if (ped.calmT > 0) ped.calmT -= dt;
+    if (ped.state === 'idle' && isThreat(ped, player, playerSpeed)) {
+      // An idler flees only when the car is very close — it was standing still.
+      const d = Math.hypot(ped.x - player.x, ped.z - player.z);
+      if (d < 6) startFlee(ped, player, time);
     }
-  }
-  if (!ped.via) {
-    const point = sidewalkPoint(city.segments[ped.seg], ped.side, ped.d);
-    tx = point.x + point.rx * ped.lateral;
-    tz = point.z + point.rz * ped.lateral;
-  }
-  const mx = tx - ped.x;
-  const mz = tz - ped.z;
-  const md = Math.hypot(mx, mz);
-  const step = Math.min(md, ped.speed * dt * 1.6);
-  if (md > 0.01) {
-    ped.x += (mx / md) * step;
-    ped.z += (mz / md) * step;
-    ped.heading = Math.atan2(mx, mz);
-    ped.bob += step * 2.2;
-  }
-  // Lamp poles and palm trunks stand on the sidewalk: step around them.
-  for (const l of city.lamps) {
-    const lx = ped.x - l.x;
-    const lz = ped.z - l.z;
-    const ld = Math.hypot(lx, lz);
-    if (ld < 0.6 && ld > 0.01) {
-      ped.x = l.x + (lx / ld) * 0.6;
-      ped.z = l.z + (lz / ld) * 0.6;
+
+    if (ped.state === 'idle') {
+      ped.timer -= dt;
+      if (ped.timer <= 0) {
+        ped.activity = ACTIVITIES[Math.floor(peds.random() * ACTIVITIES.length)];
+        ped.timer = 120 + peds.random() * 120;
+      }
+    } else if (ped.state === 'flee') {
+      ped.x += ped.fleeX * PEDS.fleeSpeed * dt;
+      ped.z += ped.fleeZ * PEDS.fleeSpeed * dt;
+      ped.heading = Math.atan2(ped.fleeX, ped.fleeZ);
+      ped.fleeT -= dt;
+      if (ped.fleeT <= 0) {
+        ped.state = 'report';
+        ped.reportT = PEDS.reportSeconds;
+      }
+    } else if (ped.state === 'report') {
+      ped.reportT -= dt;
+      if (ped.reportT <= 0) {
+        if (onReport) onReport(ped);
+        ped.state = 'return';
+      }
+    } else if (ped.state === 'return') {
+      const dx = ped.homeX - ped.x;
+      const dz = ped.homeZ - ped.z;
+      const d = Math.hypot(dx, dz);
+      if (d < 1) {
+        ped.state = 'idle';
+        ped.calmT = PEDS.calmSeconds;
+      } else {
+        ped.x += (dx / d) * PEDS.walkSpeed * dt;
+        ped.z += (dz / d) * PEDS.walkSpeed * dt;
+        ped.heading = Math.atan2(dx, dz);
+      }
     }
-  }
-  for (const p of city.palms) {
-    const px = ped.x - p.x;
-    const pz = ped.z - p.z;
-    const pd = Math.hypot(px, pz);
-    if (pd < 0.7 && pd > 0.01) {
-      ped.x = p.x + (px / pd) * 0.7;
-      ped.z = p.z + (pz / pd) * 0.7;
-    }
-  }
-  // The hero car never runs a ped over: push the ped clear of it.
-  if (dist < 1.6 && dist > 0.01) {
-    ped.x = player.x + (dx / dist) * 1.6;
-    ped.z = player.z + (dz / dist) * 1.6;
   }
 }
 
-/** One fixed step of pedestrians. */
-export function stepPeds(peds, city, player, dt, time) {
-  for (const ped of peds.list) stepPed(ped, city, player, dt, time);
+/**
+ * Day 3 hook: a witnessed event (theft, gunshot, ...) within `radius` of (x, z) makes
+ * every reactive ped nearby flee with a description snapshot. Returns how many fled.
+ */
+export function witnessEvent(peds, x, z, radius, description, time) {
+  let count = 0;
+  const all = peds.walkers.concat(peds.idlers);
+  for (const ped of all) {
+    if (!ped.reactive || ped.calmT > 0) continue;
+    if (ped.state !== 'walk' && ped.state !== 'idle') continue;
+    if (Math.hypot(ped.x - x, ped.z - z) > radius) continue;
+    const dx = ped.x - x;
+    const dz = ped.z - z;
+    const d = Math.hypot(dx, dz) || 1;
+    ped.fleeX = dx / d;
+    ped.fleeZ = dz / d;
+    ped.state = 'flee';
+    ped.fleeT = PEDS.fleeSeconds;
+    ped.sawIt = { ...description, at: time || 0 };
+    count += 1;
+  }
+  return count;
 }

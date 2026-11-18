@@ -1,238 +1,182 @@
-// Seeded city generation: a road GRAPH (nodes + segments + lanes) on a grid,
-// three districts with an explicit build policy, and every prop placed by a
-// seeded generator — the same seed gives the same city on every load. This file
-// holds plain data only; render.js turns it into three.js meshes. The graph is
-// what later drives traffic, police routing, GPS and the minimap.
-import { CITY, DISTRICTS, DISTRICT_OF_COLUMN, PALETTE } from './config.js';
-import { chance, createRandom, pick, range, rangeInt } from './random.js';
+// The seeded city: a road graph (nodes + segments + lanes) that drives traffic, police
+// routing, GPS and the minimap, plus the buildings, palms, lamps, parked cars, sea, sand,
+// harbour, pier, island and lighthouse that sit on it. Pure data — no rendering in here.
+// Blocks are 44–60 m, roads ~14 m; building footprints are clamped at least 10 m + half their
+// size from every road centreline, so no wall ever stands in a lane.
+import { CITY, PALETTE } from './config.js';
+import { createRandom, intRange, pick, range } from './random.js';
 
-const LANE_OFFSET = 3.5; // half a 7 m lane: right-hand traffic, one lane each way
-const PALM_SPACING = 12;
-const PARKED_COLORS = ['#E8E4DA', '#7FB3D5', '#D9A441', '#5B7A99', '#C96F4A', '#8FAE8B'];
-
-/** The district name at a world position (for the HUD and the minimap label). */
-export function districtAt(x, z) {
-  if (z > 190) return 'Pelabuhan';
-  if (x < -66) return DISTRICTS[0];
-  if (x > 66) return DISTRICTS[2];
-  return DISTRICTS[1];
-}
-
-/** Node coordinates: the grid is centred on the origin. */
-function nodeX(i) {
-  return (i - (CITY.nodesX - 1) / 2) * CITY.pitch;
-}
-function nodeZ(j) {
-  return (j - (CITY.nodesZ - 1) / 2) * CITY.pitch;
-}
-
-function buildRoadGraph(random) {
+export function createCity(seed) {
+  const random = createRandom(seed);
   const nodes = [];
-  for (let j = 0; j < CITY.nodesZ; j += 1) {
-    for (let i = 0; i < CITY.nodesX; i += 1) {
-      nodes.push({ id: j * CITY.nodesX + i, i, j, x: nodeX(i), z: nodeZ(j) });
-    }
-  }
-  const nodeAt = (i, j) => nodes[j * CITY.nodesX + i];
+  const nodeByKey = new Map();
   const segments = [];
-  function addSegment(a, b) {
-    const dx = b.x - a.x;
-    const dz = b.z - a.z;
-    const length = Math.hypot(dx, dz);
-    segments.push({
-      a: a.id, b: b.id, ax: a.x, az: a.z, bx: b.x, bz: b.z,
-      dx: dx / length, dz: dz / length, length,
-      horizontal: Math.abs(dz) < 0.01,
-    });
-  }
-  for (let j = 0; j < CITY.nodesZ; j += 1) {
-    for (let i = 0; i < CITY.nodesX - 1; i += 1) addSegment(nodeAt(i, j), nodeAt(i + 1, j));
-  }
-  for (let i = 0; i < CITY.nodesX; i += 1) {
-    for (let j = 0; j < CITY.nodesZ - 1; j += 1) addSegment(nodeAt(i, j), nodeAt(i, j + 1));
-  }
-  // The causeway: a road segment from the south-east corner node to the island.
-  const islandNode = { id: nodes.length, i: 7, j: 6, x: 300, z: 250 };
-  nodes.push(islandNode);
-  addSegment(nodeAt(CITY.nodesX - 1, CITY.nodesZ - 1), islandNode);
 
-  // Two lanes per segment, right-hand traffic: each lane is an offset centreline.
-  // Traffic also reads the lane's direction (horizontal) and the node it ends
-  // at (for the traffic lights), so those ride along on the lane.
-  const lanes = [];
+  function node(x, z) {
+    const key = `${x},${z}`;
+    let n = nodeByKey.get(key);
+    if (!n) {
+      n = { x, z, id: nodes.length };
+      nodeByKey.set(key, n);
+      nodes.push(n);
+    }
+    return n;
+  }
+
+  function segment(a, b, kind) {
+    segments.push({ a, b, kind: kind || 'street', id: segments.length });
+  }
+
+  // Grid avenues (north-south) and streets (east-west).
+  for (const x of CITY.avenues) {
+    const zs = [...CITY.streets, CITY.beachfrontZ];
+    for (let i = 0; i < zs.length - 1; i += 1) segment(node(x, zs[i]), node(x, zs[i + 1]), 'avenue');
+  }
+  for (const z of CITY.streets) {
+    const xs = [...CITY.avenues, CITY.harbourX];
+    for (let i = 0; i < xs.length - 1; i += 1) segment(node(xs[i], z), node(xs[i + 1], z), 'street');
+  }
+  // Beachfront along the sand, harbour road along the docks.
+  for (let i = 0; i < CITY.avenues.length - 1; i += 1) {
+    segment(node(CITY.avenues[i], CITY.beachfrontZ), node(CITY.avenues[i + 1], CITY.beachfrontZ), 'beachfront');
+  }
+  segment(node(CITY.avenues[CITY.avenues.length - 1], CITY.beachfrontZ), node(CITY.harbourX, CITY.beachfrontZ), 'beachfront');
+  for (let i = 0; i < CITY.streets.length - 1; i += 1) {
+    segment(node(CITY.harbourX, CITY.streets[i]), node(CITY.harbourX, CITY.streets[i + 1]), 'harbour');
+  }
+  segment(node(CITY.harbourX, CITY.streets[CITY.streets.length - 1]), node(CITY.harbourX, CITY.beachfrontZ), 'harbour');
+  // Causeway out to the island, and the pier into the harbour water.
+  const causewayA = node(-120, -100);
+  const causewayB = node(-135, -150);
+  const islandNode = node(CITY.island.x, CITY.island.z);
+  segment(causewayA, causewayB, 'causeway');
+  segment(causewayB, islandNode, 'causeway');
+  segment(node(CITY.harbourX, 60), node(205, 60), 'pier');
+
+  // Lanes: every segment carries two lanes, offset left/right of its centreline.
   for (const s of segments) {
-    const rx = -s.dz; // right of the travel direction, in the x/z plane
-    const rz = s.dx;
-    lanes.push({
-      sx: s.ax + rx * LANE_OFFSET, sz: s.az + rz * LANE_OFFSET,
-      ex: s.bx + rx * LANE_OFFSET, ez: s.bz + rz * LANE_OFFSET,
-      horizontal: s.horizontal, startNode: { x: s.ax, z: s.az }, endNode: { x: s.bx, z: s.bz },
-    });
-    lanes.push({
-      sx: s.bx - rx * LANE_OFFSET, sz: s.bz - rz * LANE_OFFSET,
-      ex: s.ax - rx * LANE_OFFSET, ez: s.az - rz * LANE_OFFSET,
-      horizontal: s.horizontal, startNode: { x: s.bx, z: s.bz }, endNode: { x: s.ax, z: s.az },
-    });
+    const dx = s.b.x - s.a.x;
+    const dz = s.b.z - s.a.z;
+    const len = Math.hypot(dx, dz);
+    const nx = -dz / len;
+    const nz = dx / len;
+    const off = CITY.laneOffset;
+    s.lanes = [
+      { x1: s.a.x + nx * off, z1: s.a.z + nz * off, x2: s.b.x + nx * off, z2: s.b.z + nz * off },
+      { x1: s.a.x - nx * off, z1: s.a.z - nz * off, x2: s.b.x - nx * off, z2: s.b.z - nz * off },
+    ];
+    s.length = len;
+    s.angle = Math.atan2(dx, dz); // heading along the segment, 0 = south
   }
-  return { nodes, segments, lanes };
-}
 
-function buildBuildings(random) {
+  // Buildings, one block at a time. A block is the ground between two neighbouring avenues
+  // and two neighbouring streets; the beachfront row and the harbour column are blocks too.
   const buildings = [];
-  const windows = [];
-  for (let col = 0; col < CITY.nodesX - 1; col += 1) {
-    for (let row = 0; row < CITY.nodesZ - 1; row += 1) {
-      const district = DISTRICT_OF_COLUMN[col];
-      const cx = (nodeX(col) + nodeX(col + 1)) / 2;
-      const cz = (nodeZ(row) + nodeZ(row + 1)) / 2;
-      // Two rows of plots per block, facing the horizontal roads.
-      for (const side of [-1, 1]) {
-        const count = rangeInt(random, 3, 4);
-        for (let k = 0; k < count; k += 1) {
-          if (!chance(random, 0.85)) continue;
-          const w = range(random, 12, Math.min(20, CITY.pitch / count - 2));
-          const d = range(random, 10, 14);
-          // Keep every footprint clear of the roads and their 3 m sidewalks:
-          // a plot may only sit where its whole footprint is at least 10 m
-          // from the nearest road centreline. (The west-edge plots used to
-          // spill 5 m into the beach road — the car drove into a wall.)
-          const xMin = nodeX(col) + 10 + w / 2;
-          const xMax = nodeX(col + 1) - 10 - w / 2;
-          const zMin = nodeZ(row) + 10 + d / 2;
-          const zMax = nodeZ(row + 1) - 10 - d / 2;
-          const x = Math.max(xMin, Math.min(xMax,
-            cx + (k - (count - 1) / 2) * (CITY.pitch / count) + range(random, -2, 2)));
-          const z = Math.max(zMin, Math.min(zMax, cz + side * 14 + range(random, -2, 2)));
-          let h;
-          let color;
-          if (district === 0) { // Pantai: pastel Art Deco, 3–4 floors, stepped top
-            h = range(random, 10, 16);
-            color = pick(random, PALETTE.facades);
-          } else if (district === 1) { // Kota Lama: warm mid-rise
-            h = range(random, 8, 14);
-            color = pick(random, ['#F7D774', '#E8B48C', '#D9A441', '#C98A6B', '#FFF3E0']);
-          } else { // Pelabuhan: grey industrial, some with a red roof accent
-            h = range(random, 6, 12);
-            color = chance(random, 0.3) ? PALETTE.craneRed : pick(random, ['#8A8D90', '#6E7276', '#A8A29A']);
-          }
-          const stepped = district === 0 && chance(random, 0.7);
-          buildings.push({ x, z, w, d, h, color, district, stepped });
-          // Windows on the two street-facing sides, a seeded lit subset.
-          const cols = Math.max(2, Math.floor(w / 4));
-          const rows = Math.max(2, Math.floor(h / 3.4));
-          for (const face of [-1, 1]) {
-            for (let c = 0; c < cols; c += 1) {
-              for (let r = 0; r < rows; r += 1) {
-                const wx = x + (c - (cols - 1) / 2) * (w / cols);
-                const wy = 2.2 + r * 3.2;
-                const wz = z + face * (d / 2 + 0.06);
-                windows.push({ x: wx, y: wy, z: wz, lit: chance(random, 0.35) });
-              }
-            }
-          }
+  const colEdges = [...CITY.avenues, CITY.harbourX];
+  const rowEdges = [...CITY.streets, CITY.beachfrontZ];
+  for (let c = 0; c < colEdges.length - 1; c += 1) {
+    for (let r = 0; r < rowEdges.length - 1; r += 1) {
+      const x0 = colEdges[c] + 11;
+      const x1 = colEdges[c + 1] - 11;
+      const z0 = rowEdges[r] + 11;
+      const z1 = rowEdges[r + 1] - 11;
+      if (x1 - x0 < 14 || z1 - z0 < 14) continue;
+      const downtown = Math.abs((x0 + x1) / 2) <= 65 && z1 <= 25 && z0 >= -45;
+      const count = intRange(random, 2, 4);
+      for (let i = 0; i < count; i += 1) {
+        const w = range(random, 10, 22);
+        const d = range(random, 10, 20);
+        const x = range(random, x0 + w / 2, x1 - w / 2);
+        const z = range(random, z0 + d / 2, z1 - d / 2);
+        // Keep footprints apart so walls never overlap each other.
+        let clash = false;
+        for (const other of buildings) {
+          if (Math.abs(other.x - x) < (other.hw + w / 2 + 4) && Math.abs(other.z - z) < (other.hd + d / 2 + 4)) { clash = true; break; }
         }
+        if (clash) continue;
+        const h = downtown ? range(random, 16, 30) : range(random, 8, 18);
+        buildings.push({
+          x, z, hw: w / 2, hd: d / 2, h,
+          color: pick(random, PALETTE.facades),
+          district: r === rowEdges.length - 2 ? 'Pantai' : (c === colEdges.length - 2 ? 'Pelabuhan' : (x < -30 ? 'Kota Lama' : 'Pantai')),
+        });
       }
     }
   }
-  return { buildings, windows };
-}
 
-function buildProps(random, graph, buildings) {
+  // Palms: a double row along the beachfront sand and sidewalk, plus scattered avenue palms.
   const palms = [];
-  // Palms line the beach strip road (the west edge), both sides, every ~12 m.
-  const beachX = nodeX(0);
-  for (let z = -120; z <= 120; z += PALM_SPACING) {
-    for (const side of [-1, 1]) {
-      if (!chance(random, 0.9)) continue;
-      palms.push({ x: beachX + side * 9.5 + range(random, -1, 1), z: z + range(random, -3, 3), h: range(random, 5, 7.5), lean: range(random, -0.08, 0.08) });
+  for (let x = -115; x <= 145; x += 11) {
+    if (random() < 0.72) palms.push({ x: x + range(random, -2, 2), z: 137, s: range(random, 0.85, 1.25) });
+    if (random() < 0.45) palms.push({ x: x + range(random, -2, 2), z: 123.5, s: range(random, 0.8, 1.15) });
+  }
+  for (const x of [-60, 60]) {
+    for (let z = -95; z <= 125; z += 18) {
+      if (random() < 0.5) palms.push({ x: x + (random() < 0.5 ? -8.5 : 8.5), z: z + range(random, -3, 3), s: range(random, 0.8, 1.2) });
     }
   }
-  // A few palms scattered through the Pantai blocks — never inside a building.
-  const insideBuilding = (x, z) => buildings.some(
-    (b) => Math.abs(x - b.x) < b.w / 2 + 1 && Math.abs(z - b.z) < b.d / 2 + 1,
-  );
-  for (let k = 0; k < 14; k += 1) {
-    const x = range(random, -150, -70);
-    const z = range(random, -120, 120);
-    if (insideBuilding(x, z)) continue;
-    palms.push({ x, z, h: range(random, 4.5, 7), lean: range(random, -0.1, 0.1) });
-  }
+
+  // Lamps along every street, alternating sides, and parked cars at the kerb.
   const lamps = [];
-  for (const n of graph.nodes) {
-    if (n.i === 7) continue; // the island node gets the lighthouse, not a lamp
-    lamps.push({ x: n.x + 8.5, z: n.z + 8.5 });
+  const parked = [];
+  for (const s of segments) {
+    if (s.kind === 'pier' || s.kind === 'causeway') continue;
+    const steps = Math.floor(s.length / 24);
+    for (let i = 1; i <= steps; i += 1) {
+      const t = i / (steps + 1);
+      const side = i % 2 === 0 ? 1 : -1;
+      const nx = Math.cos(s.angle) * side;
+      const nz = -Math.sin(s.angle) * side;
+      lamps.push({
+        x: s.a.x + (s.b.x - s.a.x) * t + nx * 7.4,
+        z: s.a.z + (s.b.z - s.a.z) * t + nz * 7.4,
+      });
+    }
+    const carsHere = intRange(random, 0, 3);
+    for (let i = 0; i < carsHere; i += 1) {
+      const t = range(random, 0.12, 0.88);
+      const side = random() < 0.5 ? 1 : -1;
+      const nx = Math.cos(s.angle) * side;
+      const nz = -Math.sin(s.angle) * side;
+      parked.push({
+        x: s.a.x + (s.b.x - s.a.x) * t + nx * 5.6,
+        z: s.a.z + (s.b.z - s.a.z) * t + nz * 5.6,
+        heading: s.angle + (side > 0 ? 0 : Math.PI),
+        color: pick(random, PALETTE.parked),
+      });
+    }
   }
-  const parkedCars = [];
-  const parkedSegments = graph.segments.filter((s) => s.horizontal && s.az > -100);
-  for (let k = 0; k < 12; k += 1) {
-    const s = pick(random, parkedSegments);
-    const t = range(random, 0.15, 0.85);
-    // Parked at the road's outer edge (6.2 m from the centreline), parallel
-    // to the road: the long axis lies along the segment, so traffic in the
-    // lane beside it passes with room to spare.
-    const heading = s.horizontal
-      ? (chance(random, 0.5) ? Math.PI / 2 : -Math.PI / 2)
-      : (chance(random, 0.5) ? 0 : Math.PI);
-    parkedCars.push({
-      x: s.ax + (s.bx - s.ax) * t + (s.horizontal ? 0 : 6.2),
-      z: s.az + (s.bz - s.az) * t + (s.horizontal ? 6.2 : 0),
-      heading,
-      color: pick(random, PARKED_COLORS),
-    });
-  }
-  // Containers stacked on the pier, not floating in the harbour water.
+
+  // Harbour containers, stacked in the yard between the last avenue and the docks.
   const containers = [];
-  for (let k = 0; k < 9; k += 1) {
-    containers.push({
-      x: 185 + k * 12, z: range(random, -3, 3),
-      w: 12, d: 2.6, h: 2.6,
-      color: pick(random, [PALETTE.craneRed, '#2E6E8E', '#D9A441', '#5B7A99']),
-    });
+  for (let gx = 0; gx < 4; gx += 1) {
+    for (let gz = 0; gz < 3; gz += 1) {
+      if (random() < 0.2) continue;
+      const stack = intRange(random, 1, 2);
+      for (let level = 0; level < stack; level += 1) {
+        containers.push({
+          x: 130 + gx * 5.2, z: 46 + gz * 7.5, y: 1.3 + level * 2.6,
+          color: pick(random, PALETTE.container),
+        });
+      }
+    }
   }
-  return { palms, lamps, parkedCars, containers };
+
+  return { nodes, segments, buildings, palms, lamps, parked, containers, seed };
 }
 
-/**
- * Build the whole city from a seed. Returns plain data: the road graph, the
- * buildings and windows, the props, the water, the island and the causeway,
- * and the hero car's start pose on the beach strip road, heading south into
- * the low sun.
- */
-export function buildCity(seed) {
-  const random = createRandom(seed);
-  const graph = buildRoadGraph(random);
-  const { buildings, windows } = buildBuildings(random);
-  const props = buildProps(random, graph, buildings);
-  const bounds = {
-    minX: nodeX(0) - CITY.pitch / 2,
-    maxX: nodeX(CITY.nodesX - 1) + CITY.pitch / 2,
-    minZ: nodeZ(0) - CITY.pitch / 2,
-    maxZ: nodeZ(CITY.nodesZ - 1) + CITY.pitch / 2,
-  };
-  // Traffic lights on the four central junctions (Kota Lama), each with a
-  // seeded phase offset so they do not all change at once.
-  const lights = [];
-  for (const [i, j] of [[2, 1], [3, 1], [2, 2], [3, 2]]) {
-    lights.push({ x: nodeX(i), z: nodeZ(j), offset: range(random, 0, 22) });
+/** The segment whose centreline is nearest to (x, z), for the autopilot and the GPS. */
+export function nearestSegment(city, x, z) {
+  let best = null;
+  let bestD = Infinity;
+  for (const s of city.segments) {
+    const dx = s.b.x - s.a.x;
+    const dz = s.b.z - s.a.z;
+    const t = Math.max(0, Math.min(1, ((x - s.a.x) * dx + (z - s.a.z) * dz) / (dx * dx + dz * dz)));
+    const px = s.a.x + dx * t;
+    const pz = s.a.z + dz * t;
+    const d = (x - px) * (x - px) + (z - pz) * (z - pz);
+    if (d < bestD) { bestD = d; best = { segment: s, t }; }
   }
-  return {
-    seed,
-    ...graph,
-    buildings,
-    windows,
-    ...props,
-    lights,
-    causeway: { x0: nodeX(CITY.nodesX - 1), z0: nodeZ(CITY.nodesZ - 1), x1: 300, z1: 250 },
-    sea: { x0: -620, z0: -260, x1: -186, z1: 260 },
-    sand: { x0: -186, z0: -260, x1: -172, z1: 260 },
-    harbour: { x0: 186, z0: -132, x1: 430, z1: 132 },
-    pier: { x0: 172, z0: -5, x1: 300, z1: 5 },
-    island: { x: 300, z: 250, radius: 42 },
-    lighthouse: { x: 300, z: 250, height: 26 },
-    bounds,
-    // Beach strip road, heading south: the sun (south-west) sits ahead-left.
-    // The southbound lane is the west side (right-hand traffic), so the start
-    // sits at nodeX(0) MINUS the lane offset — the east side is oncoming.
-    start: { x: nodeX(0) - LANE_OFFSET, z: -100, heading: 0 },
-  };
+  return best;
 }
